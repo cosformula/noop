@@ -4,7 +4,7 @@
 // A tool reads through a ToolStore; every write goes through ToolStore.act(op). The local store performs the op
 // (git-synced data repo, running agents); the cloud store forwards it to the primary daemon over the existing
 // owner→fleet inbox — so a write has exactly one implementation, on the machine that owns the data.
-// Never exposed here: merge, release, settings, machine credentials (policies/autonomy.md hard gates).
+// Routine schedules/prompts are owner-editable; general settings, credentials, merge and release stay gated.
 
 export type Ev = { id: string; ts: string; from: string; kind: string; text: string; ref?: string; [k: string]: unknown };
 export type FileRow = { path: string; text: string; updated: string };
@@ -17,6 +17,7 @@ export type WriteOp =
   | { tool: "cancel_task"; id: string }
   | { tool: "set_priority"; id: string; priority: Priority }
   | { tool: "reassign_task"; id: string; agent: string }
+  | { tool: "update_routine"; name: string; enabled?: boolean; every?: string; prompt?: string }
   | { tool: "remember"; text: string; file: string }
   | { tool: "edit_memory"; file: string; match: string; text: string }
   | { tool: "answer_decision"; id: string; answer: string };
@@ -153,18 +154,46 @@ export function listAgents(st: ToolStore) {
   });
 }
 /** Routines from config.toml ([[routine]] blocks): name, schedule, agent, enabled, and the first line of the prompt. */
-export function listRoutines(st: ToolStore) {
+export function listRoutines(st: ToolStore, full = false) {
   const toml = st.read("config.toml")?.text ?? "";
   // changes made from the UI live in settings.json and win over config.toml, as they do for the scheduler (loadConfig)
-  let ui: Record<string, { enabled?: boolean; every?: string }> = {};
+  let ui: Record<string, { enabled?: boolean; every?: string; prompt?: string }> = {};
   try { ui = JSON.parse(st.read("settings.json")?.text ?? "{}").routines ?? {}; } catch {}
-  return toml.split(/^\[\[routine\]\]\s*$/m).slice(1).map((b) => {
-    const block = b.split(/^\[/m)[0];
-    const v = (k: string) => block.match(new RegExp(`^${k}\\s*=\\s*"""([\\s\\S]*?)"""|^${k}\\s*=\\s*"([^"]*)"|^${k}\\s*=\\s*(\\w+)`, "m"));
-    const g = (k: string) => { const m = v(k); return m ? (m[1] ?? m[2] ?? m[3]) : undefined; };
+  // Consume whole strings before looking for another key/table: prompts can contain TOML-like headings.
+  const blocks: Record<string, string>[] = [];
+  let fields: Record<string, string> | undefined;
+  const scalar = (raw: string) => {
+    if (!raw.startsWith('"') && !raw.startsWith("'")) return raw;
+    const multi = raw.startsWith('"""') || raw.startsWith("'".repeat(3));
+    let value = raw.slice(multi ? 3 : 1, multi ? -3 : -1).replace(/\r\n/g, "\n");
+    if (multi) value = value.replace(/^\r?\n/, "");
+    if (raw.startsWith("'")) return value;
+    return value.replace(/\\(?:[ \t]*\r?\n[ \t\r\n]*|u[\da-fA-F]{4}|U[\da-fA-F]{8}|[btnfr"\\])/g, (esc) => {
+      if (/^\\[ \t]*\r?\n/.test(esc)) return "";
+      if (/^\\[uU]/.test(esc)) return String.fromCodePoint(parseInt(esc.slice(2), 16));
+      return ({ b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", '"': '"', "\\": "\\" } as Record<string, string>)[esc[1]];
+    });
+  };
+  const tokens = /^\[([^\r\n]+)\][ \t]*(?:#[^\r\n]*)?\r?$|^(\w+)[ \t]*=[ \t]*("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\r\n])*"|'[^'\r\n]*'|true|false)[ \t]*(?:#[^\r\n]*)?\r?$/gm;
+  for (const m of toml.matchAll(tokens)) {
+    if (m[1] !== undefined) {
+      fields = m[1] === "[routine]" ? {} : undefined;
+      if (fields) blocks.push(fields);
+    } else if (fields) fields[m[2]] = scalar(m[3]);
+  }
+  return blocks.map((b) => {
+    const g = (k: string) => b[k];
     const change = ui[g("name") ?? ""] ?? {};
-    return { name: g("name"), every: change.every ?? g("every"), at: g("at"), agent: g("agent"), enabled: change.enabled ?? g("enabled") !== "false", about: (g("desc") ?? g("prompt") ?? "").split("\n")[0].slice(0, 200) };
+    return { name: g("name"), every: change.every ?? g("every"), at: g("at"), agent: g("agent"), enabled: change.enabled ?? g("enabled") !== "false", about: (g("desc") ?? change.prompt ?? g("prompt") ?? "").split("\n")[0].slice(0, 200),
+      ...(full ? { prompt: change.prompt ?? g("prompt") ?? "", kind: g("kind") } : {}) };
   }).filter((r) => r.name);
+}
+
+/** Exactly the schedule forms understood by the daemon, in its local timezone. */
+export function validRoutineSchedule(every: string): boolean {
+  if (every === "hourly") return true;
+  if (/^[1-9]\d*m$/.test(every)) return Number.isSafeInteger(Number(every.slice(0, -1)) * 60_000);
+  return /^(?:daily|weekdays|weekly (?:MON|TUE|WED|THU|FRI|SAT|SUN)) (?:[01]\d|2[0-3]):[0-5]\d$/.test(every);
 }
 /** Lines of the journal (journal/YYYY-MM-DD.md) that contain every word of the query, newest day first. */
 export function searchJournal(st: ToolStore, query: string, days = 14, limit = 40) {
@@ -249,6 +278,9 @@ export const TOOLS: Tool[] = [
     description: "The agent roster: each agent's name, what it is for, and how much memory it keeps. Use the names with create_task/reassign_task." },
   { name: "list_routines", title: "List routines", annotations: RO, inputSchema: obj({}),
     description: "The fleet's recurring routines (name, schedule, agent, enabled, what it does)." },
+  { name: "get_routine", title: "Read a routine", annotations: RO,
+    inputSchema: obj({ name: str("Routine name from list_routines") }, ["name"]),
+    description: "Read a routine's effective schedule, enabled state and full prompt before changing its content. Prompts may refer to agent profiles or shared memory; read those too when explaining its behavior." },
   { name: "read_memory", title: "Read memory", annotations: RO,
     inputSchema: obj({ file: str("Optional: memory/<name>.md, agents/<name>/memory.md, agents/<name>/profile.md or policies/<name>.md; omit to list memory files"),
       query: str("Optional: only lines containing this text (case-insensitive)") }),
@@ -261,6 +293,11 @@ export const TOOLS: Tool[] = [
   { name: "fetch", title: "Fetch", annotations: RO, inputSchema: obj({ id: str("An id from search: a task (T-…) or decision (D-…)") }, ["id"]),
     description: "Full text of a task or decision found by search. Returns {id, title, text, url, metadata}." },
   // ---- write
+  { name: "update_routine", title: "Update a routine", annotations: RW_IDEM, write: true,
+    inputSchema: obj({ name: str("Existing routine name from list_routines"), enabled: { type: "boolean", description: "Enable or disable future runs; queued/running tasks are unchanged (cancel_task separately if asked)" },
+      every: str("Schedule in the daemon's local timezone: positive minutes (e.g. 120m), hourly, daily HH:MM, weekdays HH:MM, weekly MON HH:MM"),
+      prompt: str("Full replacement instructions, preserving relevant rules; read get_routine first") }, ["name"]),
+    description: "Change a routine's enabled state, frequency or full prompt when the owner explicitly requests that change. No extra confirmation for a clear request; for vague optimization, present concrete choices first. Does not change credentials, permissions, shell signals or running tasks." },
   { name: "send_message", title: "Message the fleet", annotations: RW, write: true, only: "mcp",
     inputSchema: obj({ text: str("The message, as the owner would type it in chat"), reply_to: str("Optional: task id (T-…) or event id this replies to") }, ["text"]),
     description: "Send a chat message to the fleet as the owner (same as typing in the Noop app). The chat brain answers it and acts on it." },
@@ -307,6 +344,28 @@ export function writeOp(name: string, a: any, st: ToolStore): WriteOp | string {
   a ??= {};
   const open = (id: string, dirs = ["inbox", "active", "waiting", "blocked"]) => dirs.some((d) => st.read(`tasks/${d}/${id}.md`));
   switch (name) {
+    case "update_routine": {
+      const name = s(a.name);
+      const routine = listRoutines(st, true).find((r) => r.name === name);
+      if (!routine) return `unknown routine ${name} (see list_routines)`;
+      if (Object.keys(a).some((k) => !["tool", "name", "enabled", "every", "prompt"].includes(k))) return "only enabled, every and prompt may be changed";
+      const op: Extract<WriteOp, { tool: "update_routine" }> = { tool: "update_routine", name };
+      if ("enabled" in a) {
+        if (typeof a.enabled !== "boolean") return "enabled must be a boolean";
+        op.enabled = a.enabled;
+      }
+      if ("every" in a) {
+        const every = s(a.every);
+        if (!validRoutineSchedule(every)) return "every must be positive minutes (120m), hourly, daily HH:MM, weekdays HH:MM or weekly MON HH:MM (00:00–23:59)";
+        op.every = every;
+      }
+      if ("prompt" in a) {
+        if (!s(a.prompt) || a.prompt.length > 20_000) return "prompt must be nonempty and at most 20000 characters";
+        if (routine.kind === "learn") return "learn routines use a generated prompt; only enabled and every may be changed";
+        op.prompt = a.prompt;
+      }
+      return Object.keys(op).length > 2 ? op : "provide enabled, every or prompt";
+    }
     case "send_message": return s(a.text) ? { tool: name, text: s(a.text).slice(0, 20_000), ...(s(a.reply_to) ? { reply_to: s(a.reply_to) } : {}) } : "text required";
     case "create_task": {
       if (!s(a.title)) return "title required";
@@ -391,6 +450,10 @@ export async function runTool(st: ToolStore, name: string, a: any, base = ""): P
     case "get_feed": return ok(feedView(st, a.cursor === undefined || a.cursor === null ? undefined : Number(a.cursor), Number(a.limit) || 50));
     case "list_agents": return ok({ agents: listAgents(st) });
     case "list_routines": return ok({ routines: listRoutines(st) });
+    case "get_routine": {
+      const routine = listRoutines(st, true).find((r) => r.name === s(a.name));
+      return routine ? ok(routine) : bad(`unknown routine ${s(a.name)} (see list_routines)`);
+    }
     case "read_memory": {
       const r = readMemory(st, s(a.file) || undefined, s(a.query) || undefined);
       return r ? ok(r) : bad(`${s(a.file)} not found or not readable`);

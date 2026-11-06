@@ -62,6 +62,11 @@ Open your Noop address on any device and sign in with a code sent to your email.
 
 Then just talk to it. When it needs you, you'll get a notification with the choices; answer right there.
 
+You can also manage recurring routines in the team channel: “turn off uptime-watch”, “run pr-review every two hours”,
+or “show uptime-watch's instructions” before asking to change them. Clear requests are applied directly; a broad request
+such as “optimize my routines” gets concrete choices first. Disabling a routine stops future scheduling; queued or running
+tasks stay in place unless you also ask to cancel them. Scheduled clock times use the daemon's local timezone.
+
 ## License
 
 MIT

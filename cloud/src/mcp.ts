@@ -17,7 +17,7 @@
 //   /.well-known/oauth-protected-resource, which leads to /.well-known/oauth-authorization-server:
 //   POST /oauth/register (dynamic client registration, public clients + PKCE S256 only)
 //   GET|POST /oauth/authorize (email-code sign-in page) · POST /oauth/token (authorization_code, refresh_token)
-// Never exposed: merge, release, settings, machine credentials.
+// Never exposed: merge, release, general settings, machine credentials. Routine controls are narrowly scoped.
 
 import { type Ev, type FileRow, type ToolStore, type WriteOp, DECISION_ID, TASK_ID, feedView, getTask, listDecisions, listTasks, runTool, statusView, toolsFor } from "./tools";
 export { parseDoc, listTasks, getTask, listDecisions } from "./tools";

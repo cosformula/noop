@@ -133,8 +133,8 @@ test("initialize, tools/list, resources", async () => {
   expect(init.body.result.capabilities.resources.subscribe).toBe(true);
   expect((await rpc(mcp, "notifications/initialized", {}, init.sid, null)).status).toBe(202);
   const names = (await rpc(mcp, "tools/list", {}, init.sid)).body.result.tools.map((t: any) => t.name);
-  expect(names).toEqual(["get_status", "list_tasks", "get_task", "list_decisions", "get_feed", "wait_for_events", "list_agents", "list_routines", "read_memory",
-    "search_journal", "search", "fetch", "send_message", "create_task", "amend_task", "cancel_task", "set_priority", "reassign_task", "remember", "edit_memory", "answer_decision"]);
+  expect(names).toEqual(["get_status", "list_tasks", "get_task", "list_decisions", "get_feed", "wait_for_events", "list_agents", "list_routines", "get_routine", "read_memory",
+    "search_journal", "search", "fetch", "update_routine", "send_message", "create_task", "amend_task", "cancel_task", "set_priority", "reassign_task", "remember", "edit_memory", "answer_decision"]);
   expect(names.some((n: string) => /merge|release|setting/.test(n))).toBe(false);
   const res = (await rpc(mcp, "resources/list")).body.result.resources.map((r: any) => r.uri);
   expect(res).toContain("noop://tasks/T-0184");
@@ -172,6 +172,18 @@ test("tools: read and owner-level writes", async () => {
   expect(s[0].url).toBe(`${B}/?ref=T-0184`);
   const f = (await tool(mcp, "fetch", { id: "D-0099" })).data;
   expect(f).toMatchObject({ id: "D-0099", title: "D-0099 合并吗？", metadata: { state: "open" } });
+});
+
+test("routine reads use effective overrides and MCP updates queue the same validated operation", async () => {
+  const { mcp, queued, file } = hub();
+  file("config.toml", '[[routine]]\nname = "uptime-watch"\nevery = "10m"\nagent = "ops-watcher"\nprompt = "Check alerts."\n');
+  file("settings.json", JSON.stringify({ routines: { "uptime-watch": { enabled: false, prompt: "Read memory/projects.md." } } }));
+  expect((await tool(mcp, "get_routine", { name: "uptime-watch" })).data).toMatchObject({ enabled: false, every: "10m", prompt: "Read memory/projects.md." });
+  expect((await tool(mcp, "update_routine", { name: "uptime-watch", enabled: true, every: "120m" })).data.queued).toBe(true);
+  expect(queued).toEqual([{ tool: "update_routine", name: "uptime-watch", enabled: true, every: "120m" }]);
+  expect((await tool(mcp, "update_routine", { name: "uptime-watch", every: "2h" })).isError).toBe(true);
+  expect((await tool(mcp, "update_routine", { name: "uptime-watch", readonly: false })).isError).toBe(true);
+  expect(queued).toHaveLength(1);
 });
 
 test("wait_for_events returns as soon as an event lands", async () => {

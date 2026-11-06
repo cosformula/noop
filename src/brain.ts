@@ -52,6 +52,22 @@ export function dataActs(host: string, io = { pull: _pull, push: _commitPush }):
   const pull = () => io.pull(), push = (m: string) => io.push(m);
   const findTask = (id: string, dirs: string[]) => dirs.map((d) => P("tasks", d, `${id}.md`)).find(existsSync);
   return {
+    update_routine: (op) => locked(async () => {
+      if (!await pull()) throw new Error("Cannot refresh shared settings; no routine change was made");
+      const st = localStore({ acts: {}, status: () => ({}), feed: () => [] });
+      const checked = writeOp("update_routine", op, st);
+      if (typeof checked === "string") throw new Error(checked);
+      const before = listRoutines(st, true).find((r) => r.name === op.name)!;
+      const f = P("settings.json");
+      const cur = existsSync(f) ? JSON.parse(readFileSync(f, "utf8")) : {};
+      const { tool, name, ...patch } = checked as Extract<WriteOp, { tool: "update_routine" }>;
+      const next = { ...cur, routines: { ...cur.routines, [name]: { ...cur.routines?.[name], ...patch } } };
+      writeFileSync(f, JSON.stringify(next, null, 2) + "\n");
+      const after = listRoutines(st, true).find((r) => r.name === name)!;
+      journal(host, `⚙️ owner changed routine ${name}: enabled ${before.enabled} → ${after.enabled}, every ${before.every} → ${after.every}${"prompt" in patch ? ", prompt replaced" : ""} (owner chat/MCP)`);
+      if (!await push(`[${host}] routine ${name}`)) throw new Error("Routine sync was not confirmed (offline or concurrent edit); local changes may be pending. Read get_routine before retrying");
+      return { ok: true, routine: after, note: "Applies to future scheduling; queued/running tasks are unchanged" };
+    }),
     set_priority: (op) => locked(async () => {
       await pull();
       const f = findTask(op.id, ["inbox", "active", "waiting", "blocked"]);
@@ -189,7 +205,12 @@ How to decide:
   owner asks. Without text it deletes the entry.
 - Answering or changing the answer to a decision card: answer_decision. Stop/drop a task only when clearly asked: cancel_task.
   Priority / who does it: set_priority / reassign_task.
-- Merging, releases, deploys, settings, money, messages to people: you cannot; create_task and the agent asks the owner
+- Routine controls: list_routines/get_routine to inspect; update_routine to change enabled, every or prompt when the
+  owner clearly requests it. Execute clear requests directly, without another confirmation or creating a task.
+  For vague requests ("优化 routine", "很多都不需要"), inspect and offer concrete choices; do not guess which to change.
+  Read get_routine before replacing a prompt; also read referenced agent profiles/memory when needed. Disabling stops
+  future scheduling, not tasks already queued or running; only cancel those when the owner asks. Report the saved result.
+- Merging, releases, deploys, general settings, credentials, money, messages to people: you cannot; create_task and the agent asks the owner
   with a decision card.
 
 The reply:
@@ -200,7 +221,8 @@ The reply:
 
 Tools (args as JSON; [w] = write):
 ${BRAIN_TOOLS.map((t) => `- ${t.name}${t.write ? " [w]" : ""}: ${t.description} Args: ${JSON.stringify(Object.fromEntries(Object.entries(t.inputSchema.properties ?? {}).map(([k, v]: [string, any]) => [k, `${(t.inputSchema.required ?? []).includes(k) ? "" : "optional "}${v.enum ? v.enum.join("|") : v.type}`])))}`).join("\n")}
-After write calls only, you are done (they run after your reply is posted). After any read call or an error you get the
+Routine writes run before the reply: you get their results and report what was saved (or the error).
+After other write calls only, you are done (they run after your reply is posted). After any read call or an error you get the
 results and answer again.`;
 
 export type BrainIn = {
@@ -293,7 +315,21 @@ export async function think(m: BrainIn, st: ToolStore, model: Model, post: (repl
         input = `Tool results:\n${results.join("\n")}\n\nNow answer: one JSON object.`;
         continue;
       }
-      // final turn: post the reply, then run the writes
+      // Routine updates must be confirmed by the store before claiming they were saved.
+      const routines = writes.filter((c) => c.tool === "update_routine");
+      const routineResults: string[] = [];
+      let routineFailed = false;
+      for (const c of routines) {
+        const r = await runTool(st, c.tool, c.args);
+        res.calls.push({ ...c, ok: r.ok, ...(r.ok ? { result: r.data } : { error: r.error }) });
+        routineResults.push(`${c.tool}(${JSON.stringify(c.args)}) → ${r.ok ? JSON.stringify(r.data) : `ERROR ${r.error}`}`);
+        if (!r.ok) { routineFailed = true; break; }
+      }
+      if (routines.length) {
+        input = `Tool results:\n${routineResults.join("\n")}\n${routineFailed ? "Explain the failure accurately; do not claim success or retry without reading get_routine." : "These routine changes are saved; report the results and do not repeat them."} Other writes did not run; send them again if still wanted. Answer one JSON object.`;
+        continue;
+      }
+      // Other writes retain the fast reply-before-write path.
       res.reply = turn.reply;
       const ref = m.replyTo ?? writes.map((c) => c.args?.id).find((x) => typeof x === "string" && /^T-/.test(x));
       if (turn.reply) { post(turn.reply, ref); res.ms.first_reply = Date.now() - t0; }

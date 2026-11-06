@@ -36,7 +36,7 @@ export function loadConfig(): Cfg {
   // settings.json = changes made from the UI (shared via the data repo), applied over config.toml; config.local.toml wins last
   const ui = existsSync(P("settings.json")) ? JSON.parse(readFileSync(P("settings.json"), "utf8")) : {};
   const cfg: Cfg = merge(merge(merge(sync.readHubToml(), read("config.toml")), ui), read("config.local.toml"));
-  // routine tweaks from the UI: { routines: { <name>: { enabled, every } } }
+  // Routine overrides shared by settings UI and owner chat: { routines: { <name>: { enabled, every, prompt } } }
   for (const r of cfg.routine ?? []) Object.assign(r, ui.routines?.[r.name] ?? {});
   cfg.notify ??= {};
   // the owner's own Cloudflare hub (hub cloud deploy) is the fixed address for clients and workers

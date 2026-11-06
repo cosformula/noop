@@ -61,7 +61,7 @@ export function signalChanged(r: { name: string; signal?: string }, state: Recor
   return true;
 }
 
-function runRoutines(cfg: Cfg, host: string, primary: boolean) {
+export function runRoutines(cfg: Cfg, host: string, primary: boolean) {
   const state: Record<string, string> = existsSync(STATE) ? JSON.parse(readFileSync(STATE, "utf8")) : {};
   maybeProposeNext(cfg, host, state);
   for (const r of cfg.routine ?? []) {
@@ -553,7 +553,7 @@ export async function tick(cfg: Cfg, background = false) {
     try { writeRules(); } catch (e) { console.error(`rules.md: ${e}`); }
     heartbeat(cfg, running, sample(cfg));
     if (primary) {
-      runRoutines(cfg, host, primary);
+      runRoutines(loadConfig(), host, primary); // settings may have changed in the pull above
       reapStale(cfg, host);
       wakeParents(host, ready);
       await proposeBatch(cfg, host);
