@@ -125,3 +125,14 @@ test("chat reports routine changes after saving, and returns sync failures to th
     expect(out.calls).toMatchObject([{ tool: "update_routine", ok: false, error: expect.stringContaining("sync was not confirmed") }]);
   }, { pull: async () => true, push: async () => false });
 });
+
+test("the chat model receives a whole long routine prompt before replacing its content", () => fixture(async (st) => {
+  const prompt = "Keep existing rules.\n" + "x".repeat(7000) + "\nPreserve this final rule.";
+  await runTool(st, "update_routine", { name: "uptime-watch", prompt });
+  const seen: string[] = [];
+  const turns = ['{"calls":[{"tool":"get_routine","args":{"name":"uptime-watch"}}]}', '{"reply":"已读取完整指令。"}'];
+  await think({ text: "查看 uptime-watch 完整指令" }, st, { open: async () => ({
+    send: async (input) => { seen.push(input); return turns.shift()!; }, close() {},
+  }) }, () => {});
+  expect(seen[1]).toContain("Preserve this final rule.");
+}));

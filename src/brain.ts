@@ -306,7 +306,8 @@ export async function think(m: BrainIn, st: ToolStore, model: Model, post: (repl
         for (const c of reads) {
           const r = await runTool(st, c.tool, c.args);
           res.calls.push({ ...c, ok: r.ok, ...(r.ok ? { result: r.data } : { error: r.error }) });
-          results.push(`${c.tool}(${JSON.stringify(c.args)}) → ${r.ok ? JSON.stringify(r.data).slice(0, 6000) : `ERROR ${r.error}`}`);
+          const result = r.ok ? JSON.stringify(r.data) : `ERROR ${r.error}`;
+          results.push(`${c.tool}(${JSON.stringify(c.args)}) → ${c.tool === "get_routine" ? result : result.slice(0, 6000)}`);
         }
         for (const c of unknown) results.push(`${c.tool}: ERROR no such tool`);
         for (const x of invalid) { res.calls.push({ ...x.c, ok: false, error: x.op as string }); results.push(`${x.c.tool}(${JSON.stringify(x.c.args)}) → ERROR ${x.op}`); }
