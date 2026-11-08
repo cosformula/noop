@@ -29,7 +29,7 @@ import { runTool } from "../cloud/src/tools";
 import { cloudDeploy, startCloudBridge } from "./cloud";
 import { adoptCloudUrl, readHubToml } from "./sync";
 import { judgeAccuracy, level, needsApproval, proposeBatch, resolveProposals, routineQueued, supersedeProposed } from "./autonomy";
-import { CODE, UPDATE_REQUEST, type UpdateState, setUpdateState, updateState, allowedClis, capOk, idTagFor, isPrimary, runningRev, setApprovalGate, setIdTag } from "./core";
+import { CODE, UPDATE_REQUEST, type UpdateState, setUpdateState, updateState, allowedClis, capOk, cliUsable, idTagFor, isPrimary, runningRev, setApprovalGate, setIdTag } from "./core";
 import { accountEnv, accountsStatus, classify, failoverAccount, pendingLoginIds, pickAccount, reportFailure, retryLogins, submitLoginCode } from "./accounts";
 import { channelPrompt, resolveChannels, updateChannel } from "./channels";
 
@@ -119,7 +119,7 @@ const cancelled = new Set<string>(); // tasks the owner cancelled while their ag
 async function processTask(path: string, cfg: Cfg, host: string) {
   const { meta, body } = readDoc(path);
   const wanted = allowedClis(meta, cfg);
-  const installed = (c: string) => !!Bun.which(c);
+  const installed = cliUsable;
   const first = pickAccount(cfg, wanted.filter(installed)) ?? failoverAccount(cfg, null, wanted, installed);
   const agent = meta.agent || "lead";
   if (!first) { // no usable account right now → put it back, don't fail it
@@ -624,7 +624,7 @@ export async function tick(cfg: Cfg, background = false) {
     const s = sample(cfg);
     const max = allowedParallel(s, cfg, running);
     if (running >= max) break;
-    if (!pickAccount(cfg, ["claude", "codex"].filter((c) => Bun.which(c)))) break;
+    if (!pickAccount(cfg, ["claude", "codex"].filter(cliUsable))) break;
     if ((await githubStarved(cfg)).starved && list(P("tasks", "inbox"), /^T-.*\.md$/).every((p) => GH_HEAVY.has(readDoc(p).meta.agent))) break;
     const t = pickTask(cfg, s.loadRatio, canRunHeavy(s, cfg, running));
     if (!t) break;

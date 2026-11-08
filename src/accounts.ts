@@ -5,7 +5,7 @@
 import { existsSync, statSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { type Cfg, hostName, journal, HOME_DIR } from "./core";
+import { type Cfg, cliUsable, hostName, journal, HOME_DIR } from "./core";
 import { notify } from "./notify";
 
 const HOME = join(HOME_DIR, "accounts");
@@ -56,7 +56,7 @@ const OTHER_CLI: Record<string, string> = { claude: "codex", codex: "claude" };
 
 /** After `failed` hit a quota/login wall (or nothing in `wanted` is usable when failed is null):
  *  another usable account of the same CLI first, else the other CLI (codex <-> claude) — for any agent. */
-export function failoverAccount(cfg: Cfg, failed: Account | null, wanted: string[], installed: (cli: string) => boolean = (c) => !!Bun.which(c)): Account | null {
+export function failoverAccount(cfg: Cfg, failed: Account | null, wanted: string[], installed: (cli: string) => boolean = cliUsable): Account | null {
   const same = failed ? [failed.cli] : wanted;
   const first = same.filter(installed);
   for (const cli of first) for (const a of accounts(cfg, cli)) if (usable(a) && !(failed && key(a) === key(failed))) return a;
@@ -117,7 +117,7 @@ export async function reportFailure(a: Account, kind: Failure, output: string, c
     journal(host, `${key(a)} hit usage limit → cooldown until ${st.cooldown_until.slice(11, 16)}Z`);
     if (st.told !== st.cooldown_until) {
       st.told = st.cooldown_until;
-      const others = (cfg.clis?.preference ?? ["claude", "codex"]).filter((c: string) => c !== a.cli && Bun.which(c) && accounts(cfg, c).some(usable));
+      const others = (cfg.clis?.preference ?? ["claude", "codex"]).filter((c: string) => c !== a.cli && cliUsable(c) && accounts(cfg, c).some(usable));
       const at = new Date(st.cooldown_until).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
       void notify([`${a.cli === "claude" ? "Claude" : "Codex"}（${host}）额度用完了，约 ${at} 恢复。`,
         others.length ? `这期间任务先交给 ${others.join("、")} 做。` : "这期间没有可用的 AI，任务会排队等着。",
@@ -135,7 +135,7 @@ export async function reportFailure(a: Account, kind: Failure, output: string, c
 
 async function alertIfAllExhausted(cfg: Cfg) {
   const clis: string[] = cfg.clis?.preference ?? ["claude", "codex"];
-  const installed = clis.filter((c) => Bun.which(c));
+  const installed = clis.filter(cliUsable);
   if (pickAccount(cfg, installed)) return;
   const s = load();
   const last = s.alerted?.all ? Date.parse(s.alerted.all) : 0;

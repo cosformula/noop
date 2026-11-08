@@ -6,7 +6,7 @@ import { $ } from "bun";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { arch, homedir, platform, release } from "node:os";
 import { join } from "node:path";
-import { type Cfg, CODE, DATA, hostName, HOME_DIR } from "./core";
+import { type Cfg, CODE, DATA, cliUsable, hostName, HOME_DIR } from "./core";
 
 const STATE = join(HOME_DIR, "medic.json");
 const LOGDIR = join(HOME_DIR, "medic");
@@ -60,7 +60,7 @@ export async function medic(problem: string, cfg: Cfg, opts: { auto?: boolean; k
   mkdirSync(LOGDIR, { recursive: true });
   writeFileSync(STATE, JSON.stringify(state));
 
-  const cli = ["claude", "codex"].find((c) => Bun.which(c));
+  const cli = ["claude", "codex"].find(cliUsable);
   if (!cli) { console.error("medic: neither claude nor codex is installed"); return null; }
   const prompt = PROMPT(problem, await context(), cfg.medic?.push !== false);
   const cmd = cli === "claude"

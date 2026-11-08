@@ -126,6 +126,17 @@ test("quota/auth failover: same CLI's other account, then the other CLI, else no
   expect(failoverAccount(solo, { cli: "codex", name: "zz-test-c", dir: "" }, ["codex", "claude"], all)?.cli).toBe("claude");
 });
 
+test("root host: Claude is refused under root, so Claude work goes to Codex on the first attempt", async () => {
+  const { claudeRefused } = await import("../src/core");
+  const { failoverAccount } = await import("../src/accounts");
+  expect(claudeRefused(0, {})).toBe(true); // `claude --permission-mode bypassPermissions` exits 1 as root
+  expect(claudeRefused(0, { IS_SANDBOX: "1" })).toBe(false); // the CLI allows it inside a declared sandbox
+  expect(claudeRefused(501, {})).toBe(false);
+  expect(claudeRefused(undefined, {})).toBe(false); // Windows has no uid
+  const solo = { accounts: [{ cli: "claude", name: "zz-test-a" }, { cli: "codex", name: "zz-test-c" }] } as any;
+  expect(failoverAccount(solo, null, ["claude"], (c) => c !== "claude")?.cli).toBe("codex");
+});
+
 test("restart throttle: at most one voluntary restart per hour unless forced", async () => {
   const { mkdtempSync, writeFileSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");

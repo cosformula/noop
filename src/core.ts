@@ -170,7 +170,7 @@ export type TaskOpts = {
 /** Capabilities of this machine: os:<linux|macos|windows>, host:<name>, plus config [host].caps (e.g. gpu, docker, home). */
 export function hostCaps(cfg: Cfg): string[] {
   const os = process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux";
-  const clis = ["claude", "codex", "gh", "cargo", "bun", "node"].filter((c) => Bun.which(c)).map((c) => `cli:${c}`);
+  const clis = ["claude", "codex", "gh", "cargo", "bun", "node"].filter(cliUsable).map((c) => `cli:${c}`);
   return [`os:${os}`, `host:${hostName(cfg)}`, `arch:${process.arch}`, ...clis, ...(cfg.host?.caps ?? [])];
 }
 
@@ -213,6 +213,13 @@ export function newTask(title: string, body = "", o: TaskOpts = {}): string {
 }
 
 export const which = (bin: string) => Bun.which(bin) !== null;
+
+/** Claude Code refuses bypassPermissions under root unless IS_SANDBOX is set, so every Claude run there fails at once. */
+export const claudeRefused = (uid = process.getuid?.(), env: Record<string, string | undefined> = process.env) =>
+  uid === 0 && !env.IS_SANDBOX;
+
+/** An agent CLI this machine can actually run: installed, and (for claude) not refused for running as root. */
+export const cliUsable = (cli: string) => Bun.which(cli) !== null && !(cli === "claude" && claudeRefused());
 
 /** Which CLI runs a task: the owner's per-agent config wins, else what the planner (an AI call, see planInbox) chose.
  *  Unplanned tasks may use either, Claude first. */
