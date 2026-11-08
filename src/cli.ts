@@ -7,7 +7,7 @@ import {
   type Cfg, P, ROOT, _commitPush, _pull, agentName, chooseCli, claim, commitPush, heartbeat, hostCaps, hostName, journal,
   list, loadConfig, locked, newTask, now, onlineHosts, pickTask, pull, readDoc, remember, writeDoc,
 } from "./core";
-import { amendDecision, closeDecision, IGNORE, ignoreDecision, openDecision, overrideJudge, recentJudgeIds, routeDecision } from "./decisions";
+import { amendDecision, closeDecision, IGNORE, ignoreDecision, openDecision, overrideJudge, recentJudgeIds, routeDecision, supersedeMenus } from "./decisions";
 import { notify, openDecisionIds, pollReplies } from "./notify";
 import { STALLED, agentProcs, ask, buildPrompt, parseResult, quickAsk, runAgent } from "./runner";
 import { writeRules } from "./rules";
@@ -238,6 +238,10 @@ async function processTask(path: string, cfg: Cfg, host: string) {
     const did = openDecision(meta, res, host);
     writeDoc(P("tasks", "blocked", `${meta.id}.md`), { ...done, decision: did }, body + runNote);
     journal(host, `⏸ ${meta.id} → ${did}: ${res.question}`);
+    if (meta.kind === "menu") {
+      const old = supersedeMenus(did);
+      if (old.length) journal(host, `🧹 ${did} supersedes ${old.length} unanswered menu(s): ${old.join(", ")}`);
+    }
     pendingRoute.push(did);
   } else {
     const folder = res.status === "done" ? "done" : "failed";

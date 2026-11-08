@@ -361,10 +361,15 @@ export const recentJournal = (days = 2) =>
   list(P("journal")).slice(-days).map((p) => readFileSync(p, "utf8").slice(-4000)).join("\n");
 
 export function precedents(n = 30): string {
-  return list(P("decisions", "closed")).slice(-n).map((p) => {
+  // system bookkeeping (a batch or menu replaced by a newer one) is not a ruling: keep it out of the precedents
+  const out: string[] = [];
+  for (const p of list(P("decisions", "closed")).reverse()) {
+    if (out.length >= n) break;
     const { meta } = readDoc(p);
-    return `- ${meta.id} [${meta.agent}] Q: ${meta.question}\n  → **${meta.answer}** (by ${meta.answered_by})`;
-  }).join("\n");
+    if (meta.answered_by === "system" && /^superseded/.test(meta.answer ?? "")) continue;
+    out.unshift(`- ${meta.id} [${meta.agent}] Q: ${meta.question}\n  → **${meta.answer}** (by ${meta.answered_by})`);
+  }
+  return out.join("\n");
 }
 
 export function signature(agent: string, host: string, cfg: Cfg) {

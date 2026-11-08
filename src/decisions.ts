@@ -104,6 +104,31 @@ export function closeDecision(id: string, answer: string, by: string, note = "")
   return true;
 }
 
+/** Prefix of the answer the system writes when a newer idle menu replaces an unanswered one. */
+export const SUPERSEDED = "superseded";
+
+/** A new idle menu replaces every older unanswered menu (each refresh already carries over what is still valid):
+ * close them without a lesson and without resuming their tasks, so the owner sees exactly one menu. */
+export function supersedeMenus(newId: string): string[] {
+  const closed: string[] = [];
+  for (const src of list(P("decisions", "open"))) {
+    const { meta, body } = readDoc(src);
+    if (meta.kind !== "menu" || meta.id === newId) continue;
+    writeDoc(P("decisions", "closed", `${meta.id}.md`), { ...meta, answer: `${SUPERSEDED}:${newId}`, answered_by: "system", answered: now() },
+      `${body}\n## Answer (system)\nSuperseded by the newer menu ${newId}; not an owner answer.\n`);
+    unlinkSync(src);
+    for (const task of cardTasks(meta)) {
+      const t = P("tasks", "blocked", `${task}.md`);
+      if (!existsSync(t)) continue;
+      const { meta: tm, body: tb } = readDoc(t);
+      writeDoc(P("tasks", "done", `${task}.md`), { ...tm, status: "done", superseded_by: newId }, `${tb}\n\n## Superseded by ${newId}\n`);
+      unlinkSync(t);
+    }
+    closed.push(meta.id);
+  }
+  return closed;
+}
+
 /** The answer that sets a card aside: the owner skipped it (often just forgot to pick); it is not a rejection. */
 export const IGNORE = "忽略";
 
