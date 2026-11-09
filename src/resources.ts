@@ -72,8 +72,12 @@ const sizeOf = async (p: string) => {
 const ageDays = (p: string) => (Date.now() - statSync(p).mtimeMs) / 86400e3;
 const gb = (b: number) => (b / 1e9).toFixed(1);
 
-function workRepos(cfg: Cfg): string[] {
-  const roots: string[] = (cfg.resources?.work_dirs ?? ["~/work"]).map((d: string) => d.replace(/^~/, homedir()));
+/** Agent scratch dirs the runner tells agents to build in (runner.ts); always swept, whatever work_dirs says. */
+const SCRATCH_DIRS = ["~/.noop/work", "~/.agent-hub/work"];
+
+/** Repos with build products under the configured work_dirs plus the fleet's own scratch dirs. */
+export function workRepos(cfg: Cfg, home = homedir()): string[] {
+  const roots = [...new Set([...(cfg.resources?.work_dirs ?? ["~/work"]), ...SCRATCH_DIRS].map((d: string) => d.replace(/^~/, home)))];
   return roots.filter(existsSync).flatMap((r) => readdirSync(r).map((d) => join(r, d)))
     .filter((d) => existsSync(join(d, "target")) || existsSync(join(d, "node_modules")));
 }

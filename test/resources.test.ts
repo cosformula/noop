@@ -26,3 +26,16 @@ test.skipIf(process.platform !== "darwin")("staleDerivedData picks idle and orph
     expect(got).toEqual(["App-idle", "App-orphan"]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("workRepos also sweeps the agent scratch dirs, not only work_dirs", async () => {
+  const { workRepos } = await import("../src/resources");
+  const home = mkdtempSync(join(tmpdir(), "noop-home-"));
+  try {
+    for (const d of ["work/a/target", ".agent-hub/work/metro/target", ".noop/work/web/node_modules", ".agent-hub/work/plain/src"])
+      mkdirSync(join(home, d), { recursive: true });
+    const got = workRepos({ resources: { work_dirs: ["~/work"] } } as any, home).map((p) => p.slice(home.length + 1)).sort();
+    expect(got).toEqual([".agent-hub/work/metro", ".noop/work/web", "work/a"]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
