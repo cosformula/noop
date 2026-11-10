@@ -63,6 +63,22 @@ export type TaskInfo = {
   steps?: { day?: string; time?: string; host?: string; kind?: string; text: string }[];
 };
 
+/** A task is one chronological conversation, including results missing from the live feed. */
+export function taskConversation(task: TaskInfo, events: HubEvent[]): HubEvent[] {
+  const all = [...events];
+  const same = (text: string) => all.some((e) => e.text.trim() === text.trim());
+  if (task.request && !same(task.request)) all.push({
+    id: `request:${task.id}`, ts: task.created ?? task.started ?? events[0]?.ts ?? "1970-01-01T00:00:00Z",
+    from: "owner", kind: "owner", ref: task.id, text: task.request,
+  });
+  for (const [i, run] of (task.runs ?? []).entries()) {
+    if (!run.summary || same(run.summary)) continue;
+    all.push({ id: `run:${task.id}:${i}:${run.ts}`, ts: run.ts, from: `${task.agent}@${run.host}`,
+      kind: "notice", ref: task.id, text: run.summary });
+  }
+  return all.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+}
+
 export type Status = {
   channels_revision?: string;
   tasks: Record<"proposed" | "inbox" | "active" | "blocked" | "failed" | "done", number>;
@@ -94,9 +110,9 @@ export function choicesOf(e: HubEvent): string[] {
   return [...new Set(o.map((x) => (x.match(/^\s*([A-Z])\s*[:：.]/) ?? [])[1]).filter((x): x is string => !!x))];
 }
 
-/** The option the team recommends ("建议：B" in the text), if any. */
+/** The option the team recommends ("Recommended: B" or "建议：B" in the text), if any. */
 export function recommended(e: HubEvent): string | null {
-  const m = (e.text ?? "").match(/建议：\*?([^*\s　]+)/);
+  const m = (e.text ?? "").match(/(?:建议：|Recommended: )\*?([^*\s　]+)/);
   return m ? m[1].split(/[,，]/)[0] : null;
 }
 

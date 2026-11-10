@@ -3,7 +3,7 @@ import { $ } from "bun";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
-import { CODE, DATA, P } from "./core";
+import { CODE, DATA, HOME_DIR, P } from "./core";
 
 const STATE_DIRS = [
   "tasks/proposed", "tasks/rejected", "tasks/waiting", "tasks/inbox", "tasks/active", "tasks/blocked", "tasks/failed", "tasks/done",
@@ -35,7 +35,8 @@ async function joinViaLogin(url: string, host: string): Promise<string | null> {
   const s = await post("/api/auth/start", { email });
   if (!s.ok) { console.error(`login failed (${s.status}): ${s.json?.error ?? ""}`); return null; }
   const code = (prompt("code from the email:") ?? "").trim();
-  const v = await post("/api/auth/verify", { email, code });
+  const totp = (prompt("6-digit code from the authenticator app:") ?? "").replace(/\s/g, "");
+  const v = await post("/api/auth/verify", { email, code, totp });
   if (!v.ok || !v.json?.session) { console.error(`verification failed (${v.status}): ${v.json?.error ?? ""}`); return null; }
   const j = await post("/api/host/join", { host }, v.json.session);
   await post("/api/auth/logout", {}, v.json.session); // the session was only needed to mint the machine token
@@ -57,7 +58,7 @@ export async function init(opts: { worker?: string; token?: string; primary?: bo
     const url = (opts.worker || joined || (prompt("your noop URL (e.g. https://noop.example.com; set up the first machine with --primary):") ?? "")).trim().replace(/\/$/, "");
     if (!url) { console.error("no noop URL: run init <noop-url>, or init --primary on the machine that hosts it"); process.exitCode = 1; return; }
     const token = opts.token ?? (url === joined ? readHubToml().server?.token : undefined) ?? await joinViaLogin(url, me);
-    if (!token) return;
+    if (!token) { process.exitCode = 1; return; }
     writeHubToml({ cloud: { url }, server: { token } });
     if (!(await pull())) { console.error(`could not sync from ${url} (check the URL / token)`); process.exitCode = 1; return; }
     writeLocalConfig(me);
@@ -93,6 +94,14 @@ function writeLocalConfig(me: string) {
 }
 
 // ------------------------------------------------------------------ self-update
+const REJECTED = () => join(HOME_DIR, "update-rejected"); // machine-local: a release this host already refused
+
+/** A release whose tests failed here is not tried again until origin moves on — otherwise every check
+ *  re-installs the same bad code and wakes the medic again. An explicit `hub update` still retries. */
+export function updateRejected(up: string, file = REJECTED()): boolean {
+  try { return readFileSync(file, "utf8").trim() === up; } catch { return false; }
+}
+
 /** Fast-forward framework code if origin has new commits that pass tests. Returns true if updated. */
 export async function selfUpdate(opts: { busy?: number; force?: boolean; deploy?: boolean } = {}): Promise<boolean> {
   // never swap code (and then restart) under running work: defer until this host is idle
@@ -104,6 +113,7 @@ export async function selfUpdate(opts: { busy?: number; force?: boolean; deploy?
   const head = (await g("rev-parse", "HEAD")).stdout.toString().trim();
   const up = (await g("rev-parse", "@{u}")).stdout.toString().trim();
   if (!up || head === up) return false;
+  if (!opts.force && updateRejected(up)) return false; // already failed its tests here; wait for the next release
   // upstream history may have been rewritten (e.g. scrubbed); with no local edits, follow it — tests below still guard the switch
   if ((await g("merge-base", "--is-ancestor", "HEAD", "@{u}")).exitCode !== 0) {
     // diverged: follow upstream only when it already has every local commit's change (a rewrite); unpushed work stays
@@ -116,6 +126,7 @@ export async function selfUpdate(opts: { busy?: number; force?: boolean; deploy?
   if (deps.exitCode !== 0 || test.exitCode !== 0) {
     await g("reset", "--hard", "-q", head); // roll back a bad release
     await $`bun install --frozen-lockfile`.cwd(CODE).quiet().nothrow();
+    try { mkdirSync(HOME_DIR, { recursive: true }); writeFileSync(REJECTED(), up); } catch {}
     console.error(`self-update to ${up.slice(0, 7)} failed tests → rolled back to ${head.slice(0, 7)}`);
     const { medic } = await import("./medic");
     const { loadConfig } = await import("./core");
@@ -202,6 +213,6 @@ WantedBy=default.target
     const cmd = `"${bun}" "${cli}" daemon`;
     await $`schtasks /Create /F /SC ONLOGON /RL LIMITED /TN ${SERVICE} /TR ${cmd}`.nothrow();
     await $`schtasks /Run /TN ${SERVICE}`.nothrow();
-    console.log("✔ Scheduled Task '${SERVICE}' installed (runs at logon, restarts with the daemon's own loop). Disable sleep: powercfg /change standby-timeout-ac 0");
+    console.log(`✔ Scheduled Task '${SERVICE}' installed (runs at logon, restarts with the daemon's own loop). Disable sleep: powercfg /change standby-timeout-ac 0`);
   }
 }
