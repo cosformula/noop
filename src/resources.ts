@@ -77,9 +77,21 @@ const SCRATCH_DIRS = ["~/.noop/work", "~/.agent-hub/work"];
 
 /** Repos with build products under the configured work_dirs plus the fleet's own scratch dirs. */
 export function workRepos(cfg: Cfg, home = homedir()): string[] {
-  const roots = [...new Set([...(cfg.resources?.work_dirs ?? ["~/work"]), ...SCRATCH_DIRS].map((d: string) => d.replace(/^~/, home)))];
+  const roots = [...new Set([...(cfg.resources?.work_dirs ?? ["~/work"]), ...SCRATCH_DIRS].map((d: string) => expand(d, home)))];
   return roots.filter(existsSync).flatMap((r) => readdirSync(r).map((d) => join(r, d)))
     .filter((d) => existsSync(join(d, "target")) || existsSync(join(d, "node_modules")));
+}
+
+const expand = (d: string, home: string) => d.replace(/^~/, home);
+
+/** Repos cleanup may touch. Active tasks only record their main repo, not the scratch checkout they build in
+ *  (e.g. ~/.noop/work/pr-noop-116 while meta.repo is ~/work/noop), so scratch repos are left alone entirely
+ *  while this host has any active task; work_dirs repos keep the per-repo busy check. */
+export function cleanableRepos(cfg: Cfg, busyRepos: Set<string>, hostBusy: boolean, home = homedir()): string[] {
+  const scratch = SCRATCH_DIRS.map((d) => expand(d, home) + "/");
+  return workRepos(cfg, home)
+    .filter((r) => !(hostBusy && scratch.some((s) => r.startsWith(s))))
+    .filter((r) => ![...busyRepos].some((b) => b === r || b.startsWith(r + "/")));
 }
 
 /** Last time a repo's sources were touched (git HEAD/index mtime). */
@@ -152,10 +164,10 @@ function macSteps(staleDays: number, rm: (p: string) => Promise<number>): Step[]
   ];
 }
 
-function cleanupSteps(cfg: Cfg, busyRepos: Set<string>): Step[] {
+function cleanupSteps(cfg: Cfg, busyRepos: Set<string>, hostBusy: boolean): Step[] {
   const staleDays = cfg.resources?.stale_repo_days ?? 7;
   const rm = async (p: string) => { const s = await sizeOf(p); rmSync(p, { recursive: true, force: true }); return s; };
-  const repos = () => workRepos(cfg).filter((r) => ![...busyRepos].some((b) => b === r || b.startsWith(r + "/")));
+  const repos = () => cleanableRepos(cfg, busyRepos, hostBusy);
   return [
     { name: "hub run logs > 14d", run: async () => {
       let n = 0; const d = P("logs", "runs");
@@ -209,7 +221,7 @@ function cleanupSteps(cfg: Cfg, busyRepos: Set<string>): Step[] {
 let lastCleanup = 0;
 
 /** Runs tiered cleanup until disk is back above target. Returns a human summary or null if nothing needed. */
-export async function ensureDisk(cfg: Cfg, host: string, busyRepos: Set<string>, alert: (t: string) => Promise<unknown>) {
+export async function ensureDisk(cfg: Cfg, host: string, busyRepos: Set<string>, alert: (t: string) => Promise<unknown>, hostBusy = false) {
   const r = cfg.resources ?? {};
   const low = (s: Stats) => s.diskFreeGB < (r.disk_min_gb ?? 30) || s.diskFreePct < (r.disk_min_pct ?? 10);
   let s = sample(cfg);
@@ -217,7 +229,7 @@ export async function ensureDisk(cfg: Cfg, host: string, busyRepos: Set<string>,
   lastCleanup = Date.now();
   const lines: string[] = [];
   let total = 0;
-  for (const step of cleanupSteps(cfg, busyRepos)) {
+  for (const step of cleanupSteps(cfg, busyRepos, hostBusy)) {
     const freed = await step.run().catch(() => 0);
     total += freed;
     if (freed > 1e8) lines.push(`${step.name}: ${gb(freed)}GB`);

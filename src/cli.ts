@@ -620,9 +620,9 @@ export async function tick(cfg: Cfg, background = false) {
     }
   }
   // resource governor: disk first, then adaptive parallelism
-  const busyRepos = new Set(list(P("tasks", "active"), /^T-.*\.md$/).map((p) => readDoc(p).meta)
-    .filter((m) => m.claimed_by === host && m.repo).map((m) => resolve(m.repo.replace(/^~/, homedir()))));
-  await ensureDisk(cfg, host, busyRepos, (t) => notify(t, cfg));
+  const mine = list(P("tasks", "active"), /^T-.*\.md$/).map((p) => readDoc(p).meta).filter((m) => m.claimed_by === host);
+  const busyRepos = new Set(mine.filter((m) => m.repo).map((m) => resolve(m.repo.replace(/^~/, homedir()))));
+  await ensureDisk(cfg, host, busyRepos, (t) => notify(t, cfg), mine.length > 0 || running > 0);
   const jobs: Promise<void>[] = [];
   const tried = new Set<string>();
   for (;;) {
