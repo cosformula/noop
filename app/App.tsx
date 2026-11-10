@@ -15,6 +15,7 @@ import {
   effect,
   host,
   Image,
+  Overlay,
   keymap,
   lifecycle,
   locale,
@@ -36,19 +37,20 @@ import {
   View,
   windowSize, token, openUrl, keyboardFrame, Picker, Speech, Clipboard, Notifications } from "nsh";
 import fs from "fs/promises";
-import type { InputRef, JSX, SpeechSession, ViewStyle } from "nsh";
-import { AlertDialog, Button, ContextMenu, Dialog, Menu, MenuItem, MenuSeparator, Submenu, Input, NavPage, NavStack, NumberInput, Radio, RadioGroup, Scrollbar, TextView, createNavStack, type MarkdownExtension, type TextViewBlock, type TextViewCustomNode, type TextViewInline, type TextViewRef } from "nsh/base";
+import type { InputRef, JSX, ScrollRef, SpeechSession, ViewStyle } from "nsh";
+import { AlertDialog, Toast, ToastStack, Button, ContextMenu, Dialog, Menu, MenuItem, MenuSeparator, Submenu, Input, NavPage, NavStack, NumberInput, Radio, RadioGroup, Scrollbar, TextView, createNavStack, type MarkdownExtension, type TextViewBlock, type TextViewCustomNode, type TextViewInline } from "nsh/base";
 import { isAvailable as hasWindow, titleBar, currentWindow } from "nsh/desktop";
 import { checkForPackage, checkForUpdate, downloadPackage, downloadUpdate, installAndRestart, restartToPackage, runningPackage } from "nsh/updater";
 // shellInfo through the namespace: runtimes older than it lack the export, and a missing named import would fail to link
 import * as nshUpdater from "nsh/updater";
 import { CLIENT_VERSION } from "./version";
+import { ComposerEmoji, hasEmojiPicker } from "./composer-emoji";
 import { createSettingsToast, SettingsToast } from "./settings-toast";
 import { agentDisplayName, avatarOf } from "./avatars";
 import { CheckMark } from "./ui/icons";
+import { attachmentName, isDoc } from "./files";
 import { type Channel, channelDigest, sortChannels } from "./channels";
 import { isRead, markRead, unreadEvents, toggleMessageRead, type MessageReadState as ReadState } from "./read";
-import { appendQuote } from "./quote";
 import { setupTray, type TrayChat } from "./tray";
 import { createTimelineWindow } from "./timeline";
 import { CHECK_EVERY_MS, createUpdates, shellLine, type ShellInfo, type UpdateState } from "./update";
@@ -73,6 +75,7 @@ import {
   choiceLabel,
   choicesOf,
   dayLabel,
+  dayKey,
   greeting,
   type HubEvent,
   initials,
@@ -112,7 +115,6 @@ import {
   notifyPatch,
   QUIET_PRESETS,
   quietKey,
-  firstUnread,
   type Row,
   type DataFile,
   type RuleGroup,
@@ -131,6 +133,7 @@ import {
   updateSummary,
   type UpdateLine,
   isQueued,
+  taskConversation,
   type TaskInfo,
 } from "./hub";
 import { notificationFor, type NotifyRules } from "./notify";
@@ -290,13 +293,13 @@ function createHub(cfg: Config) {
     return ((await r.json()) as { url: string }).url;
   }
 
-  async function send(text: string, replyTo: string | null, files: Attachment[] = [], thread = false, clientId?: string) {
+  async function send(text: string, replyTo: string | null, files: Attachment[] = [], thread = false, clientId?: string, channel?: string) {
     const attachments: string[] = [];
     for (const f of files) attachments.push(await upload(f));
     const r = await fetch(`${cfg.url}/api/messages`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ text, ...(clientId ? { client_id: clientId } : {}), ...(replyTo ? { reply_to: replyTo } : {}), ...(attachments.length ? { attachments } : {}), ...(thread ? { thread } : {}) }),
+      body: JSON.stringify({ text, ...(clientId ? { client_id: clientId } : {}), ...(replyTo ? { reply_to: replyTo } : {}), ...(attachments.length ? { attachments } : {}), ...(thread ? { thread } : {}), ...(channel ? { channel } : {}) }),
     });
     if (r.status === 401) conn.set("unauthorized");
     if (!r.ok) throw new Error(L(`Send failed (${r.status})`, `发送失败（${r.status}）`));
@@ -610,10 +613,37 @@ function ghInlines(inlines: TextViewInline[]): TextViewInline[] {
     return "content" in i && Array.isArray(i.content) ? ({ ...i, content: ghInlines(i.content) } as TextViewInline) : i;
   });
 }
+/** A link's target, so ".../pull/12" and ".../issues/12" (what "nsh #12" links to) count as the same one. */
+const linkKey = (url: string) => { const m = url.match(GH); return m ? `${m[1]}/${m[2]}#${m[4]}`.toLowerCase() : url.replace(/\/$/, ""); };
+const inlineText = (i: TextViewInline): string => ("text" in i && typeof i.text === "string" ? i.text : "content" in i && Array.isArray(i.content) ? i.content.map(inlineText).join("") : "");
+/**
+ * A paragraph gives each link once: a later link to the same target is dropped when it is only the bare URL
+ * ("NSH #1394 https://github.com/longbridge/nsh/pull/1394"), and otherwise keeps its words as plain text.
+ */
+function onceInlines(inlines: TextViewInline[], seen = new Set<string>()): TextViewInline[] {
+  const out: TextViewInline[] = [];
+  for (const i of inlines) {
+    if (i.type === "link") {
+      const key = linkKey(i.url);
+      if (!seen.has(key)) { seen.add(key); out.push(i); continue; }
+      const words = inlineText(i);
+      if (words.replace(/\/$/, "") === i.url.replace(/\/$/, "")) {
+        // drop the repeat with the space that joined it
+        const prev = out[out.length - 1];
+        if (prev?.type === "text") out[out.length - 1] = { ...prev, text: prev.text.replace(/[ \t]+$/, "") };
+        continue;
+      }
+      out.push(...i.content);
+      continue;
+    }
+    out.push("content" in i && Array.isArray(i.content) ? ({ ...i, content: onceInlines(i.content, seen) } as TextViewInline) : i);
+  }
+  return out;
+}
 function ghBlocks(blocks: TextViewBlock[]): TextViewBlock[] {
   return blocks.map((b): TextViewBlock => {
     const x = { ...b } as Record<string, unknown>;
-    if (Array.isArray(x.content)) x.content = ghInlines(x.content as TextViewInline[]);
+    if (Array.isArray(x.content)) x.content = ghInlines(onceInlines(x.content as TextViewInline[]));
     if (Array.isArray(x.children)) x.children = ghBlocks(x.children as TextViewBlock[]);
     if (Array.isArray(x.items)) x.items = (x.items as { children: TextViewBlock[] }[]).map((it) => ({ ...it, children: ghBlocks(it.children) }));
     return x as TextViewBlock;
@@ -630,6 +660,10 @@ function reposIn(text: string, into = new Map<string, string>()): Map<string, st
 }
 
 const REF = /(^|[^\w\/\[#&])(?:([A-Za-z][\w.-]*)( ?))?#(\d+)\b/g;
+/** A word before "#N" naming a repository, not what the ref is: "docs#3", "video-tool #2" (not "PR #3", "and #4"). */
+const repoWord = (name: string, sp: string) => !/^(pr|issue)s?$/i.test(name) && (!sp || /[-_.\d]/.test(name));
+/** A line's or clause's label ("docs：#12", "- web-app: ..."), not a URL's scheme. */
+const LABEL = /(?:^|[\n。；;，,])[\s*+\-\d.)]*([A-Za-z][\w.-]*)\**\s*[:：](?!\/\/)/g;
 
 /**
  * A "#746" is a GitHub PR or issue: "nsh #747" / "NSH#747" links to that repository when the channel has linked it
@@ -646,16 +680,36 @@ function linkRepoRefs(text: string, context = ""): string {
     if (slug) named.add(slug);
   }
   const only = named.size === 1 ? [...named][0] : null;
+  // where each known repository is named in the text ("NSH：", "GPUI Kit", "nsh#1", a link): a bare "#N" belongs to the
+  // closest one before it, so a per-project summary links each line's refs to its own project
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const names = [...known.keys()].sort((a, b) => b.length - a.length);
+  const mention = new RegExp(`(?<![\\w-])(${names.map((k) => esc(k).replace(/[-_]/g, "[-_ ]?")).join("|")})(?![\\w-])`, "gi");
+  const flat = (k: string) => k.toLowerCase().replace(/[-_ ]/g, "");
+  const slugOf = (name: string) => [...known].find(([k]) => flat(k) === flat(name))?.[1];
+  const marks: [number, string][] = [];
+  for (const m of text.matchAll(mention)) {
+    const slug = slugOf(m[1]);
+    if (slug) marks.push([m.index!, slug]);
+  }
+  // a repository it doesn't know, named before a ref or as a label ("video-tool #2", "docs：#12"), ends the one
+  // before it: the refs after it aren't that one's
+  for (const m of text.matchAll(REF)) if (m[2] && repoWord(m[2], m[3]) && !slugOf(m[2])) marks.push([m.index! + m[1].length, ""]);
+  for (const m of text.matchAll(LABEL)) if (repoWord(m[1], "") && !slugOf(m[1])) marks.push([m.index! + m[0].lastIndexOf(m[1]), ""]);
+  marks.sort((a, b) => a[0] - b[0]);
+  const near = (at: number) => { let s: string | null = null; for (const [i, slug] of marks) { if (i >= at) break; s = slug; } return s; };
   const url = (slug: string, n: string) => `https://github.com/${slug}/issues/${n}`;
-  return text.split(/(`[^`\n]*`)/).map((part, i) => (i % 2 ? part : part.replace(
+  let base = 0;
+  return text.split(/(`[^`\n]*`)/).map((part, i) => { const off = base; base += part.length; return i % 2 ? part : part.replace(
     REF,
-    (all, pre: string, name: string | undefined, sp: string, n: string) => {
-      const slug = name && known.get(name.toLowerCase());
+    (all, pre: string, name: string | undefined, sp: string, n: string, at: number) => {
+      const slug = name && slugOf(name);
       if (slug) return `${pre}[${name}${sp}#${n}](${url(slug, n)})`;
-      if (!only || (name && !sp && !/^(pr|issue)s?$/i.test(name))) return all;
-      return `${pre}${name ? name + sp : ""}[#${n}](${url(only, n)})`;
+      const repo = near(off + at + pre.length) ?? only;
+      if (!repo || (name && repoWord(name, sp))) return all;
+      return `${pre}${name ? name + sp : ""}[#${n}](${url(repo, n)})`;
     },
-  ))).join("");
+  ); }).join("");
 }
 
 /** Hub text keeps its line breaks: single newlines become hard breaks, outside code fences. */
@@ -702,29 +756,12 @@ function Custom(props: { node: TextViewCustomNode; small: boolean }) {
   );
 }
 
-// Invalidates pending Markdown reads when another selection or composer action wins.
-let selectionGeneration = 0;
-
-/** Selectable message Markdown; selection previews are owned by the composer. */
-function Rich(props: { text: string; muted?: boolean; quiet?: boolean; context?: string; onQuote?: (markdown: string) => void }) {
-  let documentRef: TextViewRef | undefined;
-  let selectionVersion = 0;
-  const captureSelection = async ({ text }: { text: string }) => {
-    if (!props.onQuote || !text.trim()) return;
-    const version = ++selectionVersion;
-    const generation = ++selectionGeneration;
-    // Publish immediately so a selection in another message replaces the preview.
-    props.onQuote(text);
-    try {
-      const markdown = await documentRef?.selectedText({ format: "markdown" });
-      if (version === selectionVersion && generation === selectionGeneration && markdown?.trim()) props.onQuote(markdown.trim());
-    } catch { /* The plain-text selection remains available. */ }
-  };
-  cleanup(() => { selectionVersion++; });
-  effect(() => { props.text; selectionVersion++; });
+/** Selectable message Markdown. */
+function Rich(props: { text: string; muted?: boolean; quiet?: boolean; context?: string; scale?: number }) {
   const small = !!(props.muted || props.quiet);
-  const fontSize = props.quiet ? 14 : props.muted ? size.small : size.text;
-  const lineHeight = small ? 21 : size.line;
+  const k = () => props.scale ?? 1;
+  const fontSize = () => (props.quiet ? 14 : props.muted ? size.small : size.text) * k();
+  const lineHeight = () => (small ? 21 : size.line) * k();
   const doc = () => {
     const d = TextView.parse(hubMarkdown(linkRepoRefs(props.text, props.context)), { math: false, html: false }, EXTENSIONS);
     return { ...d, blocks: ghBlocks(d.blocks) };
@@ -732,37 +769,19 @@ function Rich(props: { text: string; muted?: boolean; quiet?: boolean; context?:
   return (
     <View style={{ gap: 6 }}>
       <TextView
-        ref={(ref) => { documentRef = ref; }}
-        onSelectionChange={captureSelection}
         document={doc()}
         selectable
         onLinkPress={({ url }) => { if (/^(https?|mailto):/i.test(url)) void openUrl(url).catch(() => {}); }}
         renderCustom={(node) => <Custom node={node} small={small} />}
         styles={{
-          root: { gap: 8, fontSize, lineHeight, color: small ? colors.muted : colors.text },
-          code: { fontFamily: MONO, fontSize: small ? 13 : 14.5, color: colors.text, backgroundColor: alpha(colors.text, 0.07) },
+          root: { gap: 8 * k(), fontSize: fontSize(), lineHeight: lineHeight(), color: small ? colors.muted : colors.text },
+          code: { fontFamily: MONO, fontSize: (small ? 13 : 14.5) * k(), color: colors.text, backgroundColor: alpha(colors.text, 0.07) },
           emphasis: { fontStyle: "normal", fontWeight: "600" },
           link: { color: linkColor(), textDecorationColor: token("link-underline") },
         }}
       />
     </View>
   );
-}
-
-/** Selection actions belong to the floating composer, outside the scrolling messages. */
-function QuotePreview(props: { text: string; onQuote: () => void; onCancel: () => void }) {
-  return <If when={props.text}>
-    <View testID="quote-preview" style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 8, paddingVertical: 4, ...composerGlass(), borderRadius: radius.inset }}>
-      <Button testID="quote-selection" accessibilityLabel={L("Quote selection", "引用片段")} onPress={() => { selectionGeneration++; props.onQuote(); }}
-        style={{ flex: 1, minWidth: 0, minHeight: touch ? 44 : 32, justifyContent: "center", borderRadius: radius.control }} hoverStyle={hovered()} focusStyle={focusRing()}>
-        <Text style={{ numberOfLines: 1, fontSize: size.small, color: colors.text }}>{props.text.replace(/\s+/g, " ").trim()}</Text>
-      </Button>
-      <Button testID="cancel-quote" accessibilityLabel={L("Cancel quote", "取消引用片段")} onPress={() => { selectionGeneration++; props.onCancel(); }}
-        style={{ width: touch ? 44 : 32, height: touch ? 44 : 32, alignItems: "center", justifyContent: "center", borderRadius: radius.control }} hoverStyle={hovered()} focusStyle={focusRing()}>
-        <Icon name="close" size={14} tint={colors.muted} />
-      </Button>
-    </View>
-  </If>;
 }
 
 /** Puts an image (by URL) on the system clipboard as an image, not as its link. */
@@ -785,6 +804,7 @@ function Media(props: { hub: Hub; path: string }) {
   const ratio = signal(16 / 10);
   const zoomed = signal(false);
   const frame: ViewStyle = { borderRadius: radius.inset, backgroundColor: colors.inset };
+  if (isDoc(props.path)) return <DocAttachment src={src} name={attachmentName(props.path)} />;
   if (isVideo(props.path)) return <Video src={src} controls paused style={{ ...frame, borderWidth: 1, borderColor: colors.border, width: "100%", maxWidth: 480, aspectRatio: 16 / 9 }} />;
   // a thumbnail that keeps the timeline readable; press it to see the full image
   const THUMB = 240;
@@ -838,6 +858,132 @@ function Media(props: { hub: Hub; path: string }) {
   );
 }
 
+/** The report open in the chat's reader pane: one at a time, shared by every file card in the timeline. */
+type DocRef = { src: string; name: string; at?: string };
+const reading = signal<DocRef | null>(null);
+/** The page the reader belongs to (a channel or a task); a report opened on one page never shows on another. */
+const readerAt = signal("");
+/** Report bodies already fetched, so reopening or switching back is instant. Bounded, newest kept; a failed one loads again when reopened or retried. */
+type DocBody = { text: string | null; error: string };
+const DOC_CACHE_MAX = 16;
+const docCache = new Map<string, Signal<DocBody>>();
+function clearDocCache() {
+  docCache.clear();
+  reading.set(null);
+}
+function loadDoc(src: string, body: Signal<DocBody>) {
+  body.set({ text: null, error: "" });
+  void fetch(src)
+    .then(async (r) => {
+      if (r.ok) return body.set({ text: stripFrontMatter(await r.text()), error: "" });
+      body.set({ text: null, error: r.status === 404 ? L("This file has expired.", "这个文件已过期。") : L(`Couldn’t load (${r.status})`, `读取失败（${r.status}）`) });
+    })
+    .catch(() => {
+      body.set({ text: null, error: L("Can’t reach the server", "连不上服务器") });
+    });
+}
+function docBody(src: string) {
+  const hit = docCache.get(src);
+  if (hit) {
+    docCache.delete(src);
+    docCache.set(src, hit);
+    if (untracked(hit).error) loadDoc(src, hit);
+    return hit;
+  }
+  const body = signal<DocBody>({ text: null, error: "" });
+  docCache.set(src, body);
+  while (docCache.size > DOC_CACHE_MAX) docCache.delete(docCache.keys().next().value!);
+  loadDoc(src, body);
+  return body;
+}
+function retryDoc(src: string, body: Signal<DocBody>) {
+  if (!docCache.has(src)) {
+    docCache.set(src, body);
+    while (docCache.size > DOC_CACHE_MAX) docCache.delete(docCache.keys().next().value!);
+  }
+  loadDoc(src, body);
+}
+
+/** A Markdown report attached to a message: a file card that opens the report in the chat's reader pane. */
+function DocAttachment(props: { src: string; name: string }) {
+  const active = () => reading()?.src === props.src && reading()?.at === readerAt();
+  const stem = () => props.name.replace(/\.(md|markdown)$/i, "");
+  return (
+    <View
+      testID="doc-attachment"
+      role="button"
+      accessibilityLabel={L(`Open ${props.name}`, `打开 ${props.name}`)}
+      accessibilityState={{ selected: active() }}
+      onPress={() => reading.set(active() ? null : { src: props.src, name: props.name, at: readerAt() })}
+      hoverStyle={active() ? undefined : { borderColor: colors.fieldBorder, backgroundColor: alpha(colors.text, 0.03) }}
+      style={{
+        flexDirection: "row", alignItems: "center", gap: 12, width: 344, maxWidth: "100%", padding: 14,
+        borderRadius: radius.inset, borderCurve: "continuous", borderWidth: 1, cursor: "pointer",
+        borderColor: active() ? alpha(colors.info, 0.35) : colors.border,
+        backgroundColor: active() ? alpha(colors.info, 0.04) : colors.background,
+      }}
+    >
+      <View style={{ width: 40, height: 44, flexShrink: 0, borderRadius: 8, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface, alignItems: "center", justifyContent: "center", gap: 3 }}>
+        <Icon name="document" size={18} tint={active() ? colors.info : colors.muted} />
+        <Text style={{ fontFamily: MONO, fontSize: 8, fontWeight: "600", letterSpacing: 0.5, color: colors.faint }}>MD</Text>
+      </View>
+      <View style={{ flex: 1, minWidth: 0, gap: 3 }}>
+        <Text style={{ fontSize: 14, lineHeight: 19, fontWeight: "600", color: colors.text, numberOfLines: 2 }}>{stem()}</Text>
+        <Text style={{ fontSize: 12, lineHeight: 16, color: active() ? colors.info : colors.faint, numberOfLines: 1 }}>
+          {active() ? L("Markdown · Reading", "Markdown · 正在阅读") : L("Markdown · Report", "Markdown · 报告")}
+        </Text>
+      </View>
+      <Icon name="chevron" size={14} tint={active() ? colors.info : colors.faint} />
+    </View>
+  );
+}
+
+const DOC_SCALES = [0.875, 1, 1.125, 1.25, 1.4];
+/** The reader beside the chat (a full sheet on a phone): the open report rendered with TextView, with text zoom and a wider pane. */
+function DocPane(props: { doc: DocRef; wide: boolean; expanded: boolean; onExpand: () => void; onClose: () => void }) {
+  const step = signal(1);
+  // looked up once per report, so a re-render never fetches again by itself
+  const cell = computed(() => { const src = props.doc.src; return untracked(() => docBody(src)); });
+  const body = () => cell()();
+  const btn = (p: { id: string; icon: IconName; label: string; on?: boolean; disabled?: boolean; onPress: () => void }) => (
+    <View testID={p.id} role="button" accessibilityLabel={p.label} accessibilityState={{ disabled: !!p.disabled }}
+      onPress={p.disabled ? undefined : p.onPress} hoverStyle={p.disabled ? undefined : hovered()}
+      style={{ width: props.wide ? 28 : 36, height: props.wide ? 28 : 36, borderRadius: 6, alignItems: "center", justifyContent: "center", cursor: p.disabled ? "default" : "pointer", opacity: p.disabled ? 0.35 : 1, backgroundColor: p.on ? alpha(colors.text, 0.07) : undefined }}>
+      <Icon name={p.icon} size={15} tint={colors.muted} />
+    </View>
+  );
+  return (
+    <View testID="doc-reader" style={{ flex: 1, minWidth: 0, backgroundColor: colors.background }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 2, height: props.wide ? 44 : 52, paddingLeft: 14, paddingRight: 8, borderBottomWidth: 1, borderColor: colors.border, backgroundColor: colors.surface }}>
+        <Icon name="document" size={16} tint={colors.muted} />
+        <Text testID="doc-title" style={{ flex: 1, minWidth: 0, marginLeft: 8, marginRight: 6, fontSize: 13.5, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{props.doc.name}</Text>
+        {btn({ id: "doc-zoom-out", icon: "zoom-out", label: L("Smaller text", "缩小文字"), disabled: step() === 0, onPress: () => step.set(Math.max(0, step() - 1)) })}
+        <Text testID="doc-scale" style={{ width: 36, textAlign: "center", fontSize: 11.5, fontVariant: ["tabular-nums"], color: colors.faint }}>{`${Math.round(DOC_SCALES[step()] * 100)}%`}</Text>
+        {btn({ id: "doc-zoom-in", icon: "zoom-in", label: L("Larger text", "放大文字"), disabled: step() === DOC_SCALES.length - 1, onPress: () => step.set(Math.min(DOC_SCALES.length - 1, step() + 1)) })}
+        <If when={props.wide}>
+          {btn({ id: "doc-expand", icon: props.expanded ? "minimize" : "maximize", label: props.expanded ? L("Narrow reader", "收窄阅读栏") : L("Widen reader", "加宽阅读栏"), on: props.expanded, onPress: props.onExpand })}
+        </If>
+        {btn({ id: "doc-close", icon: "close", label: L("Close reader", "关闭阅读栏"), onPress: props.onClose })}
+      </View>
+      <Scroll style={{ flex: 1 }}>
+        <View selectable style={{ width: "100%", maxWidth: 760, alignSelf: "center", gap: 12, paddingHorizontal: props.wide ? 28 : 20, paddingTop: 28, paddingBottom: 48 }}>
+          <If when={body().text !== null} else={
+            <View style={{ gap: 10, alignItems: "flex-start" }}>
+              <Text testID="doc-status" style={{ fontSize: 14, color: body().error ? colors.danger : colors.faint }}>{body().error || L("Loading…", "读取中…")}</Text>
+              <If when={body().error}>
+                <Btn label={L("Retry", "重试")} onPress={() => retryDoc(props.doc.src, cell())} testID="doc-retry" />
+              </If>
+            </View>
+          }>
+            <Rich text={body().text ?? ""} scale={DOC_SCALES[step()]} />
+          </If>
+        </View>
+      </Scroll>
+    </View>
+  );
+}
+
+
 // ---------------------------------------------------------------- timeline
 
 /** Messages the hub just confirmed: a quiet check beside their timestamp fades away. */
@@ -862,13 +1008,13 @@ function SentCheck() {
       accessibilityLabel={L("Sent", "已发送")}
       style={{ width: 14, height: 16, alignItems: "center", justifyContent: "center", opacity: fade }}
     >
-      <CheckMark size={14} weight={1.8} tint={colors.muted} />
+      <CheckMark size={14} weight={2.2} tint={colors.muted} />
     </View>
   );
 }
 
 /** A message the owner sent that the hub has not confirmed yet: it reads as sent unless delivery fails. */
-type Outgoing = { id: string; ts: string; text: string; ref: string | null; files: Attachment[]; state: "held" | "sending" | "failed" };
+type Outgoing = { id: string; ts: string; text: string; ref: string | null; files: Attachment[]; state: "held" | "sending" | "failed"; channel?: string };
 
 /** Each agent's own color and mark, the same everywhere it appears (stable by its id). */
 const MARKS = ["★", "◆", "▲", "●", "✦", "☾", "✿", "♪"];
@@ -923,7 +1069,12 @@ function optionText(e: HubEvent, c: string): string {
   if (c === "all" || c === "none") return choiceLabel(c);
   const full = (e.options ?? []).find((o) => new RegExp(`^\\s*${c}\\s*([:：.、)]|\\s)`).test(o));
   // a button can't hold a link: a GitHub PR / issue URL reads as "nsh#747"
-  return full ? full.trim().replace(/https:\/\/github\.com\/[\w.-]+\/([\w.-]+)\/(?:pull|issues)\/(\d+)\/?/g, "$1#$2") : choiceLabel(c);
+  return full ? shortGitHubRefs(full.trim()) : choiceLabel(c);
+}
+
+/** Plain text that can't hold a link (buttons, notifications): a GitHub PR / issue URL reads as "nsh#747". */
+function shortGitHubRefs(text: string): string {
+  return text.replace(/https:\/\/github\.com\/[\w.-]+\/([\w.-]+)\/(?:pull|issues)\/(\d+)\/?/g, "$1#$2");
 }
 
 type Proposal = { n: string; title: string; agent: string; note: string };
@@ -951,10 +1102,17 @@ function proposalsOf(text: string): Proposal[] {
   return out;
 }
 
+/** The checklist items of a card: an approval batch from its text, a next-steps menu from its options. */
+function menuItems(e: HubEvent): Proposal[] {
+  return proposalsOf(e.kind === "menu" ? (e.options ?? []).join("\n") : e.text);
+}
+
 /** An approval batch as a checklist: tick what may start, then approve. */
 function ProposalList(props: { event: HubEvent; selection: Map<string, Signal<Set<string>>>; done: boolean; onAnswer: (ref: string, choice: string) => void; onReply: (ref: string) => void }) {
   const e = props.event;
-  const items = proposalsOf(e.text);
+  // a next-steps menu is the same checklist: several items may start at once (D-0215 was answered by typing "1,2")
+  const menu = e.kind === "menu";
+  const items = menuItems(e);
   let picked = props.selection.get(e.id);
   if (!picked) { picked = signal<Set<string>>(new Set()); props.selection.set(e.id, picked); }
   const selection = picked;
@@ -963,7 +1121,7 @@ function ProposalList(props: { event: HubEvent; selection: Map<string, Signal<Se
   return (
     <>
       <View style={{ paddingHorizontal: 16, paddingTop: 8, paddingBottom: 6 }}>
-        <Text style={{ fontSize: size.small, color: colors.muted }}>{L(`The team wants to do ${items.length} things. Check the ones to start:`, `团队想做这 ${items.length} 件事，勾选同意开始的：`)}</Text>
+        <Text style={{ fontSize: size.small, color: colors.muted }}>{menu ? L(`Next steps: check the ones to do (${items.length} options)`, `下一步做哪些？勾选要做的（共 ${items.length} 项）`) : L(`The team wants to do ${items.length} things. Check the ones to start:`, `团队想做这 ${items.length} 件事，勾选同意开始的：`)}</Text>
       </View>
       <View style={{ paddingHorizontal: 8, paddingBottom: 8 }}>
         <Each of={items}>
@@ -995,8 +1153,8 @@ function ProposalList(props: { event: HubEvent; selection: Map<string, Signal<Se
         <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: 2, paddingBottom: 16 }}>
           <Btn testID={`approve-${e.ref}`} label={selection().size ? L(`Approve selected (${selection().size})`, `批准所选（${selection().size}）`) : L("Approve selected", "批准所选")} kind="primary" disabled={!selection().size}
             onPress={() => answer([...selection()].sort((a, b) => +a - +b).join(","))} />
-          <Btn testID={`opt-${e.ref}-all`} label={L("Approve all", "全部批准")} kind="secondary" onPress={() => answer("all")} />
-          <Btn testID={`opt-${e.ref}-none`} label={L("None", "都不要")} kind="ghost" onPress={() => answer("none")} />
+          <Btn testID={`opt-${e.ref}-all`} label={L("Approve all", "全部批准")} kind="secondary" onPress={() => answer(menu ? "全部" : "all")} />
+          <Btn testID={`opt-${e.ref}-none`} label={L("None", "都不要")} kind="ghost" onPress={() => answer(menu ? "都不要" : "none")} />
           <View style={{ flex: 1 }} />
           <Btn testID={`other-${e.ref}`} label={L("Other instructions…", "其他指示…")} kind="dashed" onPress={() => props.onReply(e.ref!)} />
         </View>
@@ -1012,7 +1170,7 @@ const IGNORE = "忽略";
 function answerText(t: string): string {
   const [, ref, rest] = t.match(/^([DLP]-[A-Z]?\d{4}) (.+)$/) ?? [, "", t];
   const a = rest.trim();
-  if (ref.startsWith("P-")) {
+  if (ref.startsWith("P-") || /^\d+(\s*[,，]\s*\d+)+$/.test(a)) {
     if (/^(all|全部)$/i.test(a)) return L("Approve all", "全部批准");
     if (/^(none|都不要)$/i.test(a)) return L("None", "都不要");
     if (/^\d+(\s*[,，]\s*\d+)*$/.test(a)) { const items = a.split(/\s*[,，]\s*/); return L(`Approve ${items.join(", ")}`, `批准 ${items.join("、")}`); }
@@ -1094,7 +1252,7 @@ function OwnerBubble(props: { hub: Hub; event: HubEvent; out?: Outgoing; onRetry
           </View>
         </If>
         <If when={e.attachments?.length}>
-          <View testID="owner-images" style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: 6, opacity: props.out ? 0.65 : 1 }}>
+          <View testID="owner-images" style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", alignItems: "flex-end", gap: 6, opacity: props.out ? 0.65 : 1 }}>
             <Each of={e.attachments ?? []}>{(a) => <Media hub={props.hub} path={a()} />}</Each>
           </View>
         </If>
@@ -1158,7 +1316,6 @@ function Message(props: {
   target: () => string | null;
   onAnswer: (ref: string, choice: string) => void;
   onReply: (ref: string, note?: string) => void;
-  onQuote?: (markdown: string, ref?: string) => void;
   selection?: Map<string, Signal<Set<string>>>;
   /** Unread on this device; the dot by the name and the action under the message. */
   unread?: () => boolean;
@@ -1180,9 +1337,9 @@ function Message(props: {
   };
   const body = (
     <View style={{ gap: 10 }}>
-      <Rich text={ask ? e.text.replace(/\n*^建议：.*$/m, "").trimEnd() : e.text} muted={e.kind === "system" && isHub(e.from)} context={about()} onQuote={props.onQuote ? (markdown) => props.onQuote?.(markdown, e.ref) : undefined} />
+      <Rich text={ask ? e.text.replace(/\n*^(?:建议：|Recommended: ).*$/m, "").trimEnd() : e.text} muted={e.kind === "system" && isHub(e.from)} context={about()} />
       <If when={e.attachments?.length}>
-        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10 }}>
+        <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 10 }}>
           <Each of={e.attachments ?? []}>{(a) => <Media hub={props.hub} path={a()} />}</Each>
         </View>
       </If>
@@ -1195,20 +1352,20 @@ function Message(props: {
   // a phone has no width to spare: the avatar sits in the name's row, and the message takes the whole column
   const wide = () => windowSize().width >= WIDE;
   if (isHub(e.from) && !ask && e.kind === "system" && !e.attachments?.length)
+    // top-aligned on one shared line height: baseline alignment drifts once the text carries an inline chip
     return (
-      <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8, paddingVertical: 4, paddingLeft: wide() ? 50 : 0 }}>
-        <Text style={{ fontSize: size.tiny, color: colors.faint, fontVariant: ["tabular-nums"] }}>{timeOf(e.ts)}</Text>
+      <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 8, paddingVertical: 4, paddingLeft: wide() ? 50 : 0 }}>
+        <Text style={{ fontSize: size.tiny, lineHeight: 21, color: colors.faint, fontVariant: ["tabular-nums"] }}>{timeOf(e.ts)}</Text>
         <View selectable style={{ flex: 1, minWidth: 0 }}><Rich text={e.text} quiet /></View>
       </View>
     );
   return (
-    <View style={{ flexDirection: "row", gap: 14, paddingVertical: 10 }} onMouseEnter={() => over.set(true)} onMouseLeave={() => over.set(false)}>
-      <If when={wide()}><Avatar testID={`avatar-column-${e.id}`} from={e.from} /></If>
+    <View testID={`msg-${e.id}`} style={{ flexDirection: "row", gap: 14, paddingVertical: 10, paddingHorizontal: 10, marginHorizontal: -10, backgroundColor: props.unread?.() ? alpha(colors.info, 0.035) : "transparent", borderRadius: radius.card, transitionProperty: "backgroundColor", transitionDuration: 240 }} onMouseEnter={() => over.set(true)} onMouseLeave={() => over.set(false)}>
+      <If when={wide()}><View style={{ position: "relative", alignSelf: "flex-start" }}><Avatar testID={`avatar-column-${e.id}`} from={e.from} /><If when={props.unread?.()}><View testID={`unread-dot-${e.id}`} accessibilityLabel={L("Unread", "未读")} style={{ position: "absolute", top: -2, right: -2, width: 10, height: 10, borderRadius: 5, borderWidth: 2, borderColor: colors.background, backgroundColor: colors.info }} /></If></View></If>
       <View style={{ flex: 1, minWidth: 0, gap: 4 }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: 22 }}>
-          <If when={!wide()}><Avatar testID={`avatar-inline-${e.id}`} from={e.from} small /></If>
+          <If when={!wide()}><View style={{ position: "relative" }}><Avatar testID={`avatar-inline-${e.id}`} from={e.from} small /><If when={props.unread?.()}><View testID={`unread-dot-${e.id}`} accessibilityLabel={L("Unread", "未读")} style={{ position: "absolute", top: -2, right: -2, width: 10, height: 10, borderRadius: 5, borderWidth: 2, borderColor: colors.background, backgroundColor: colors.info }} /></If></View></If>
           <Text style={{ fontSize: 15, fontWeight: "600", color: colors.text }}>{displayName(e.from)}</Text>
-          <If when={props.unread?.()}><View testID={`unread-dot-${e.id}`} accessibilityLabel={L("Unread", "未读")} style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: colors.accentFill }} /></If>
           <Text style={{ fontSize: size.tiny, color: colors.faint, fontVariant: ["tabular-nums"] }}>{timeOf(e.ts)}</Text>
           {tag && !ask ? <Badge label={tag} /> : null}
         </View>
@@ -1229,10 +1386,13 @@ function Message(props: {
               <Text style={{ fontFamily: MONO, fontSize: 13, color: colors.muted }}>{e.ref}</Text>
               <View style={{ flex: 1 }} />
               <If when={done()}>
-                <Text style={{ fontSize: 13, color: colors.up }}>{L("✓ Replied", "✓ 已回复")}</Text>
+                <View testID={`replied-${e.ref}`} style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+                  <Icon name="check" size={14} tint={colors.up} />
+                  <Text style={{ fontSize: 13, color: colors.up }}>{L("Replied", "已回复")}</Text>
+                </View>
               </If>
             </View>
-            {e.kind === "proposals" && proposalsOf(e.text).length ? (
+            {(e.kind === "proposals" || e.kind === "menu") && menuItems(e).length ? (
               <ProposalList event={e} selection={selection} done={done()} onAnswer={props.onAnswer} onReply={props.onReply} />
             ) : (
             <>
@@ -1332,7 +1492,9 @@ function createMessageReads(hub: Hub) {
     if (next !== old) persist(next);
   };
   const unread = computed(() => loaded() ? unreadEvents(hub.events(), state()) : []);
-  return { loaded, state, read, unread,
+  // the main chat's own: what was said inside a channel is counted on that channel only
+  const main = computed(() => unread().filter((e) => !e.channel));
+  return { loaded, state, read, unread, main,
     ref: (id: string) => read(untracked(hub.events).filter((e) => e.ref === id), true),
     toggle: (e: HubEvent) => persist(toggleMessageRead(untracked(state), e)),
     all: () => persist({ through: untracked(hub.events).reduce((ts, e) => e.ts > ts ? e.ts : ts, untracked(state).through), ids: [], marked: [] }),
@@ -1363,106 +1525,92 @@ function createChannels(hub: Hub, reads: MessageReads) {
     list, load, reads,
     unread: (c: Channel) => {
       const refs = new Set(c.refs ?? c.items.filter((i) => i.kind !== "report").map((i) => i.id));
-      return reads.unread().filter((e) => !!e.ref && refs.has(e.ref)).length;
+      // the same messages the channel shows, so opening it clears exactly what was counted
+      return channelDigest(reads.unread(), [...refs], c.slug, Infinity).length;
     },
-    async save(slug: string, patch: { goal?: string; archived?: boolean }) {
+    async save(slug: string, patch: { name?: string; goal?: string; archived?: boolean }) {
       generation++;
       const r = await hub.api("POST", "/api/channels", { slug, ...patch });
-      if (r.ok) list.set(sortChannels(untracked(list).map((c) => (c.slug === slug ? { ...c, ...(patch.goal !== undefined ? { goal: patch.goal } : {}), ...(patch.archived !== undefined ? { status: patch.archived ? "archived" : "active" } : {}) } : c))));
+      if (r.ok) list.set(sortChannels(untracked(list).map((c) => (c.slug === slug ? { ...c, ...(patch.name ? { name: patch.name } : {}), ...(patch.goal !== undefined ? { goal: patch.goal } : {}), ...(patch.archived !== undefined ? { status: patch.archived ? "archived" : "active" } : {}) } : c))));
       return r.ok;
     },
   };
 }
 type Channels = ReturnType<typeof createChannels>;
 
+/** A page whose head has scrolled out of sight: what its title bar shows in the head's place, and how to bring the head back. */
+type Folded = { title: string; detail: string; reveal: () => void };
+/** How far a page scrolls before its head's title row is under the bar: past a channel's 44 pt mark and name, past a task's state row and title. */
+const CHANNEL_HEAD = 52;
+const TASK_HEAD = 72;
+
 /** One channel: its goal (editable), archive, and the tasks and cards that belong to it, newest first. */
-function ChannelPage(props: { hub: Hub; channels: Channels; slug: string; wide: boolean; onTask: (id: string) => void; onPick: (ref: string) => void; onDoc: (path: string) => void }) {
+/** A channel's head above its conversation: name and purpose together, actions out of the way. The conversation itself is the main chat's. */
+function ChannelHeader(props: { channels: Channels; slug: string }) {
   const ch = () => props.channels.list().find((c) => c.slug === props.slug);
   const editing = signal(false);
   const goal = signal("");
+  const name = signal("");
   const busy = signal(false);
-
-  // the channel reads like the main chat narrowed to its topic: results and decisions, newest last; no task plumbing
-  const fetched = signal<HubEvent[]>([]);
-  const loaded = signal(false);
-  const load = async () => {
-    const r = await props.hub.api("GET", `/api/channels/feed?slug=${encodeURIComponent(props.slug)}`).catch(() => null);
-    if (r?.ok && Array.isArray(r.data.events)) fetched.set(r.data.events as HubEvent[]);
-    loaded.set(true);
-  };
-  effect(() => { ch()?.last_activity; void load(); });
-  const digest = computed(() => channelDigest(merge(fetched(), props.hub.events()), ch()?.refs ?? ch()?.items.filter((i) => i.kind !== "report").map((i) => i.id) ?? []));
-  const settled = computed(() => answeredIds(digest()));
-
   const saveGoal = async () => {
     busy.set(true);
-    if (await props.channels.save(props.slug, { goal: untracked(goal).trim() })) editing.set(false);
+    const n = untracked(name).trim(), g = untracked(goal).trim(), c = ch()!;
+    const patch = { ...(n && n !== c.name ? { name: n } : {}), ...(g !== c.goal ? { goal: g } : {}) };
+    if (!Object.keys(patch).length || (await props.channels.save(props.slug, patch))) editing.set(false);
     busy.set(false);
   };
   return (
-    <View testID="channel-page" style={{ flex: 1 }}>
-      <View style={{ width: "100%", maxWidth: size.column, alignSelf: "center", flex: 1, gap: 14, paddingHorizontal: props.wide ? 32 : 16, paddingVertical: 20 }}>
+    <View testID="channel-page" style={{ paddingTop: 8, paddingBottom: 12 }}>
         <If when={ch()} else={<Text style={{ fontSize: 14, color: colors.faint }}>{L("Loading…", "读取中…")}</Text>}>
-          <View style={{ gap: 6 }}>
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-              <Text style={{ flex: 1, fontSize: 20, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{`# ${ch()!.name}`}</Text>
+          {/* header: a channel reads like a room, name and purpose together, actions out of the way */}
+          <View testID="channel-header" style={{ flexDirection: "row", alignItems: "flex-start", gap: 14, paddingBottom: 8 }}>
+            <View style={{ width: 44, height: 44, borderRadius: radius.card, alignItems: "center", justifyContent: "center", backgroundColor: alpha(colors.accent, 0.12) }}>
+              <Text style={{ fontSize: 22, fontWeight: "700", color: colors.accent }}>#</Text>
+            </View>
+            <View style={{ flex: 1, minWidth: 0, gap: 4 }}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <Text style={{ flexShrink: 1, fontSize: 20, fontWeight: "700", color: colors.text, numberOfLines: 1 }}>{ch()!.name}</Text>
+                <If when={ch()!.status === "archived"}><View testID="channel-archived"><Badge label={L("Archived", "已归档")} tone="warn" /></View></If>
+                <If when={ch()!.status === "active" && ch()!.stale}><View testID="channel-stale"><Badge label={L("Quiet 7 days", "7 天无动静")} /></View></If>
+              </View>
+              <If when={editing()} else={
+                <Text testID="channel-goal" style={{ fontSize: 14.5, lineHeight: 21, color: ch()!.goal ? colors.muted : colors.faint, userSelect: "text" }}>{ch()!.goal || L("No goal yet", "还没有目标")}</Text>
+              }>
+                <View style={{ gap: 8, paddingTop: 4 }}>
+                  <Input
+                    testID="channel-name-input"
+                    value={name()}
+                    onChange={({ value }) => name.set(value)}
+                    onSubmit={() => void saveGoal()}
+                    placeholder={L("Channel name", "Channel 名称")}
+                    class="placeholder:text-faint"
+                    style={{ height: 38, paddingHorizontal: 12, fontSize: 15, fontWeight: "600", color: colors.text, borderRadius: radius.control, borderWidth: 1, borderColor: colors.fieldBorder, backgroundColor: colors.surface }}
+                  />
+                  <Input
+                    testID="channel-goal-input"
+                    value={goal()}
+                    onChange={({ value }) => goal.set(value)}
+                    onSubmit={() => void saveGoal()}
+                    placeholder={L("What this channel is for: the team assigns work by it", "这个 channel 是做什么的，团队按它归类工作")}
+                    class="placeholder:text-faint"
+                    style={{ height: 38, paddingHorizontal: 12, fontSize: 15, color: colors.text, borderRadius: radius.control, borderWidth: 1, borderColor: colors.fieldBorder, backgroundColor: colors.surface }}
+                  />
+                  <View style={{ flexDirection: "row", gap: 8 }}>
+                    <Btn testID="channel-save-goal" kind="primary" label={L("Save", "保存")} disabled={busy()} onPress={() => void saveGoal()} />
+                    <Btn testID="channel-cancel-goal" kind="ghost" label={L("Cancel", "取消")} onPress={() => editing.set(false)} />
+                  </View>
+                </View>
+              </If>
+            </View>
+            <View style={{ flexDirection: "row", gap: 4 }}>
+              <If when={!editing()}>
+                <Btn testID="channel-edit-goal" kind="ghost" label={L("Edit", "编辑")} onPress={() => { name.set(ch()!.name); goal.set(ch()!.goal); editing.set(true); }} />
+              </If>
               <Btn testID="channel-archive" kind="ghost" label={ch()!.status === "archived" ? L("Unarchive", "取消归档") : L("Archive", "归档")}
                 onPress={() => void props.channels.save(props.slug, { archived: ch()!.status !== "archived" })} />
             </View>
-            <If when={ch()!.status === "archived"}>
-              <Text testID="channel-archived" style={{ fontSize: 13.5, color: colors.warn }}>{L("Archived: the team no longer adds work here.", "已归档：团队不再往这里归类新的工作。")}</Text>
-            </If>
-            <If when={ch()!.status === "active" && ch()!.stale}>
-              <Text testID="channel-stale" style={{ fontSize: 13.5, color: colors.muted }}>{L("No activity in 7 days", "7 天没有动静")}</Text>
-            </If>
-          </View>
-          <View style={{ gap: 8 }}>
-            <Text style={{ fontSize: 12, fontWeight: "600", color: colors.muted, letterSpacing: 0.4 }}>{L("Goal", "目标")}</Text>
-            <If when={editing()} else={
-              <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 8 }}>
-                <Text testID="channel-goal" style={{ flex: 1, fontSize: 14.5, lineHeight: 21, color: ch()!.goal ? colors.text : colors.faint, userSelect: "text" }}>{ch()!.goal || L("No goal yet", "还没有目标")}</Text>
-                <Btn testID="channel-edit-goal" kind="secondary" label={L("Edit", "编辑")} onPress={() => { goal.set(ch()!.goal); editing.set(true); }} />
-              </View>
-            }>
-              <Input
-                testID="channel-goal-input"
-                value={goal()}
-                onChange={({ value }) => goal.set(value)}
-                onSubmit={() => void saveGoal()}
-                placeholder={L("What this channel is for: the team assigns work by it", "这个 channel 是做什么的，团队按它归类工作")}
-                class="placeholder:text-faint"
-                style={{ height: 38, paddingHorizontal: 12, fontSize: 15, color: colors.text, borderRadius: radius.control, borderWidth: 1, borderColor: colors.fieldBorder, backgroundColor: colors.surface }}
-              />
-              <View style={{ flexDirection: "row", gap: 8 }}>
-                <Btn testID="channel-save-goal" kind="primary" label={L("Save", "保存")} disabled={busy()} onPress={() => void saveGoal()} />
-                <Btn testID="channel-cancel-goal" kind="ghost" label={L("Cancel", "取消")} onPress={() => editing.set(false)} />
-              </View>
-            </If>
-          </View>
-          <View testID="channel-digest" style={{ gap: 16, paddingTop: 4 }}>
-            <Text style={{ fontSize: 12, fontWeight: "600", color: colors.muted, letterSpacing: 0.4 }}>{L("Updates", "进展")}</Text>
-            <If when={digest().length} else={<Text style={{ fontSize: 14, color: colors.faint }}>{loaded() ? L("No results or decisions yet", "还没有结果或决策") : L("Loading…", "读取中…")}</Text>}>
-              <Each of={digest()} key={(e) => e.id}>
-                {(e) => isAsk(e()) ? (
-                  <Message hub={props.hub} event={e()} answered={settled} target={() => null}
-                    onAnswer={(ref, choice) => void props.hub.send(`${ref} ${choice}`, ref, [], true)}
-                    onReply={(ref) => props.onTask(ref)} />
-                ) : (
-                  <View style={{ gap: 3 }}>
-                    <View role="button" testID={`channel-msg-${e().id}`} accessibilityLabel={e().ref} onPress={() => { props.channels.reads.ref(e().ref!); props.onTask(e().ref!); }}>
-                      <Text style={{ fontSize: 13, color: colors.faint }}>
-                        <Text style={{ fontWeight: "600", color: e().from === "owner" ? colors.accent : colors.muted }}>{e().from === "owner" ? L("You", "你") : displayName(e().from)}</Text>
-                        {`  ${timeOf(e().ts)}`}
-                      </Text>
-                    </View>
-                    <Rich text={e().text} />
-                  </View>
-                )}
-              </Each>
-            </If>
           </View>
         </If>
-      </View>
     </View>
   );
 }
@@ -1535,7 +1683,7 @@ function TaskHistory(props: { hub: Hub; wide: boolean; onTask: (id: string) => v
   );
 }
 
-function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
+function TaskDetail(props: { hub: Hub; id: string; wide: boolean; onFold?: (folded: Folded | null) => void }) {
   // a task past the status snapshot's newest few is read on its own
   const older = signal<(TaskInfo & { decisions?: string[]; events?: HubEvent[] }) | null>(null);
   const missing = signal(false);
@@ -1547,9 +1695,6 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
   void props.hub.api("GET", `/api/tasks/get?id=${encodeURIComponent(props.id)}`).then((r) => {
     if (r.ok) older.set(r.data as TaskInfo); else missing.set(true);
   });
-  const section = (title: string) => (
-    <Text role="header" style={{ fontSize: 13, fontWeight: "600", color: colors.muted, marginTop: 24, marginBottom: 8 }}>{title}</Text>
-  );
   const cancellable = () => ["active", "inbox", "nohost", "waiting", "parked", "blocked", "proposed"].includes(t()?.state ?? "");
   const cancelling = signal(false);
   async function cancel() {
@@ -1571,24 +1716,18 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
     const refs = new Set([props.id, ...(older()?.decisions ?? []), ...(t()?.decision ? [t()!.decision!] : [])]);
     return merge(merge(older()?.events ?? [], props.hub.events()), saying()).filter((e) => !!e.ref && refs.has(e.ref) && (e.thread || !(isHub(e.from) && e.kind === "system")));
   });
-  const settled = computed(() => answeredIds(talk()));
+  const conversation = computed(() => taskConversation({ ...older(), ...t(), id: props.id, title: t()?.title ?? "", agent: t()?.agent ?? "", request: older()?.request ?? t()?.request, runs: older()?.runs ?? t()?.runs }, talk()));
+  const timeline = computed(() => rows(conversation()));
+  const settled = computed(() => answeredIds(merge(props.hub.events(), talk())));
   const text = signal("");
-  const taskExcerpt = signal("");
   let taskComposer: InputRef | undefined;
-  const quote = (markdown: string) => {
-    taskExcerpt.set("");
-    text.update((draft) => appendQuote(draft, markdown));
-    taskComposer?.focus();
-    taskComposer?.setSelection(text().length);
-  };
+  let taskCaret: { start: number; end: number } | null = null;
   const note = signal("");
   const hint = signal("");
   let said = 0;
   async function say() {
     const v = text().trim();
     if (!v) return;
-    selectionGeneration++;
-    taskExcerpt.set("");
     // reads as sent at once; only a failure brings the words back to the box, with the reason
     const id = `local:${++said}`;
     saying.update((l) => [...l, { id, ts: new Date().toISOString(), from: "owner", kind: "owner", ref: props.id, thread: true, text: v }]);
@@ -1603,14 +1742,32 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
     saying.update((l) => l.filter((x) => x.id !== id));
   }
   const composerHeight = signal(0);
+  const showActivity = signal(false);
+  const stateLabel = () => (t()!.state === "nohost" ? L(`Waiting for ${needsLabel(t()!.needs)}`, `等 ${needsLabel(t()!.needs)}`) : STATE_OF()[t()!.state ?? ""]?.[0] ?? t()!.state ?? "");
+  // Once the title has scrolled under the page's bar, the bar carries it; back at the top, the head shows it again.
+  let page: ScrollRef | undefined;
+  const headPassed = signal(false);
+  const foldTitle = computed(() => (headPassed() && t() ? t()!.title : null));
+  const foldDetail = computed(() => (headPassed() && t() ? `${props.id} · ${stateLabel()}` : ""));
+  effect(() => {
+    const title = foldTitle(), detail = foldDetail();
+    untracked(() => props.onFold?.(title === null ? null : { title, detail, reveal: () => page?.scrollTo({ y: 0, animated: !reduceMotion() }) }));
+  });
+  cleanup(() => props.onFold?.(null));
   return (
     <View style={{ flex: 1 }}>
-    <Scroll style={{ flex: 1 }}>
+    <Scroll
+      testID="task-page"
+      ref={(r) => { page = r; }}
+      scrollEventThrottle={100}
+      onScroll={(ev) => { const passed = ev.offset.y > TASK_HEAD; if (passed !== untracked(headPassed)) headPassed.set(passed); }}
+      style={{ flex: 1 }}
+    >
       <View style={{ width: "100%", maxWidth: size.column, alignSelf: "center", paddingHorizontal: props.wide ? 32 : 16, paddingTop: 24, paddingBottom: composerHeight() + 24 }}>
         <If when={t()} else={<Text style={{ fontSize: 15, color: colors.muted }}>{missing() ? L(`Can’t find ${props.id}.`, `找不到 ${props.id}。`) : L("Loading…", "读取中…")}</Text>}>
-          <View style={{ gap: 8 }}>
+          <View testID="task-head" style={{ gap: 8 }}>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-              <Badge label={t()!.state === "nohost" ? L(`Waiting for ${needsLabel(t()!.needs)}`, `等 ${needsLabel(t()!.needs)}`) : STATE_OF()[t()!.state ?? ""]?.[0] ?? t()!.state ?? ""} tone={t()!.state === "failed" ? "danger" : t()!.state === "blocked" ? "warn" : "neutral"} />
+              <Badge label={stateLabel()} tone={t()!.state === "failed" ? "danger" : t()!.state === "blocked" ? "warn" : "neutral"} />
               <Text style={{ fontFamily: MONO, fontSize: 13, color: colors.muted }}>{t()!.id}</Text>
               <View style={{ flex: 1 }} />
               <If when={cancellable() && !cancelling()}>
@@ -1623,7 +1780,7 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
             </View>
             <Text style={{ userSelect: "text", fontSize: 20, fontWeight: "600", color: colors.text }}>{t()!.title}</Text>
             <Text style={{ fontSize: 14, color: colors.muted }}>
-              {[displayName(t()!.agent), t()!.host, t()!.model ?? t()!.cli,
+              {[displayName(t()!.agent), t()!.host, t()!.activity?.model ?? t()!.model ?? t()!.cli,
                 t()!.started ? L(`Started ${clock(t()!.started!)}`, `${clock(t()!.started!)} 开始`) : "",
                 t()!.state === "active" ? L(`Running for ${since(t()!.started)}`, `已运行 ${since(t()!.started)}`) : t()!.finished ? L(`Took ${since(t()!.started, t()!.finished)}`, `用时 ${since(t()!.started, t()!.finished)}`) : "",
                 Number(t()!.attempt ?? 1) > 1 ? L(`Attempt ${t()!.attempt}`, `第 ${t()!.attempt} 次`) : ""].filter(Boolean).join(" · ")}
@@ -1641,63 +1798,23 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
               </Text>
             </View>
           </If>
-          <If when={t()!.request}>
-            {section(L("Request", "请求"))}
-            <View selectable><Rich text={t()!.request ?? ""} context={t()!.title} /></View>
-          </If>
-          <If when={talk().length}>
-            {section(L("Conversation", "对话"))}
-            <View testID="task-talk" style={{ gap: 14 }}>
-              <Each of={talk()} key={(e) => e.id}>
-                {(e) => isAsk(e()) ? (
-                  <Message hub={props.hub} event={e()} answered={settled} target={() => null}
-                    onAnswer={(ref, choice) => void props.hub.send(`${ref} ${choice}`, ref, [], true).catch((err) => note.set(String((err as Error)?.message ?? err)))}
-                    onQuote={(markdown) => taskExcerpt.set(markdown)}
-                    onReply={() => hint.set(L("Write your instructions in the box below; they’ll be sent as the answer to this card.", "在下面的输入框写你的指示，会作为这张卡片的回答。"))} />
-                ) : (
-                  <View style={{ gap: 3 }}>
-                    <Text style={{ fontSize: 13, color: colors.faint }}>
-                      <Text style={{ fontWeight: "600", color: e().from === "owner" ? colors.accent : colors.muted }}>{e().from === "owner" ? L("You", "你") : displayName(e().from)}</Text>
-                      {`  ${timeOf(e().ts)}`}
-                    </Text>
-                    <Rich text={e().text} onQuote={e().from !== "owner" ? (markdown) => taskExcerpt.set(markdown) : undefined} />
-                    <If when={e().attachments?.length}>
-                      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-                        <Each of={e().attachments ?? []}>{(a) => <Media hub={props.hub} path={a()} />}</Each>
-                      </View>
-                    </If>
-                  </View>
-                )}
-              </Each>
-            </View>
-          </If>
-          <If when={t()!.runs?.length}>
-            {section(L("Result", "结果"))}
-            <View style={{ gap: 12 }}>
-              <Each of={[...(t()!.runs ?? [])].reverse()}>
-                {(r) => (
-                  <View style={{ gap: 4 }}>
-                    <Text style={{ fontSize: 13, color: colors.faint, fontVariant: ["tabular-nums"] }}>{`${r().ts.slice(5, 16).replace("T", " ")} · ${r().host} · ${r().status}`}</Text>
-                    <Rich text={r().summary} context={`${t()!.title}\n${t()!.request ?? ""}`} />
-                  </View>
-                )}
-              </Each>
-            </View>
-          </If>
+          <View testID="task-talk" style={{ gap: 14, marginTop: 24 }}>
+            <Each of={timeline()} key={(row) => row.key}>
+              {(item) => {
+                const row = item();
+                if ("day" in row) return <Text style={{ alignSelf: "center", fontSize: 13, color: colors.faint, marginVertical: 8 }}>{dayLabel(row.day)}</Text>;
+                const e = row.event;
+                if (e.from === "owner") return <OwnerBubble hub={props.hub} event={e} />;
+                return <Message hub={props.hub} event={e} answered={settled} target={() => null}
+                  onAnswer={(ref, choice) => void props.hub.send(`${ref} ${choice}`, ref, [], true).catch((err) => note.set(String((err as Error)?.message ?? err)))}
+                  onReply={() => hint.set(L("Write your instructions in the box below.", "在下面的输入框继续说。"))} />;
+              }}
+            </Each>
+          </View>
           <If when={t()!.steps?.length}>
-            {section(L("Progress", "进度"))}
-            <View selectable style={{ gap: 6 }}>
-              <Each of={t()!.steps ?? []}>
-                {(st) => (
-                  <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 10 }}>
-                    <Text style={{ width: 44, fontSize: 13.5, lineHeight: 21, color: colors.faint, fontVariant: ["tabular-nums"] }}>{st().time ?? ""}</Text>
-                    <View style={{ width: 12, height: 21, alignItems: "center", justifyContent: "center" }}>
-                      <Dot tone={st().kind === "done" ? "off" : st().kind === "fail" ? "bad" : st().kind === "decision" ? "wait" : "off"} />
-                    </View>
-                    <View style={{ flex: 1, minWidth: 0 }}><Rich text={st().text.replace(new RegExp(`^${t()!.id}\\b\\s*(→\\s*)?[:：]?\\s*`), "")} muted context={t()!.title} /></View>
-                  </View>
-                )}
-              </Each>
+            <View style={{ marginTop: 24, gap: 6 }}>
+              <Btn label={L("Activity", "运行记录")} kind="ghost" onPress={() => showActivity.set(!showActivity())} />
+              <If when={showActivity()}><Each of={t()!.steps ?? []}>{(st) => <Text style={{ fontSize: 13, lineHeight: 20, color: colors.muted }}>{`${st().day ?? ""} ${st().time ?? ""}  ${st().text}`}</Text>}</Each></If>
             </View>
           </If>
         </If>
@@ -1708,7 +1825,6 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
         onLayout={({ bounds }) => composerHeight.set(bounds.size.height)}
         style={{ position: "absolute", bottom: 0, width: "100%", maxWidth: size.column, alignSelf: "center", gap: 6, paddingHorizontal: props.wide ? 32 : 10, paddingTop: 4, paddingBottom: 12, pointerEvents: "box-none" }}
       >
-        <QuotePreview text={taskExcerpt()} onQuote={() => quote(taskExcerpt())} onCancel={() => taskExcerpt.set("")} />
         <If when={note()}>
           <Text style={{ fontSize: 13, color: colors.danger }}>{note()}</Text>
         </If>
@@ -1718,7 +1834,8 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
         <View style={{ flexDirection: "row", alignItems: "flex-end", gap: 8, paddingLeft: 16, paddingRight: 8, paddingVertical: 8, ...composerGlass() }}>
           <Input
             testID="task-composer"
-            ref={(ref) => { taskComposer = ref; }}
+            ref={(r) => (taskComposer = r)}
+            onSelectionChange={({ start, end }) => (taskCaret = { start, end })}
             multiline
             value={text()}
             onChange={({ value }) => text.set(value)}
@@ -1727,6 +1844,20 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
             placeholder={L(`Continue in ${props.id}…`, `在 ${props.id} 里继续说…`)}
             class="placeholder:text-faint"
             style={{ flex: 1, minHeight: 36, maxHeight: 160, paddingVertical: 8, fontSize: 15, lineHeight: 21, color: colors.text, borderWidth: 0, backgroundColor: "transparent" }}
+          />
+          <ComposerEmoji touch={touch}
+            onOpen={() => { if (touch) taskComposer?.blur(); }}
+            onSelect={(emoji) => {
+              const value = text();
+              const start = Math.min(taskCaret?.start ?? value.length, value.length);
+              const end = Math.min(Math.max(taskCaret?.end ?? start, start), value.length);
+              text.set(value.slice(0, start) + emoji + value.slice(end));
+              taskCaret = { start: start + emoji.length, end: start + emoji.length };
+            }}
+            onInserted={() => {
+              taskComposer?.focus();
+              if (taskCaret) taskComposer?.setSelection(taskCaret.start, taskCaret.end);
+            }}
           />
           <SendButton testID="task-send" disabled={!text().trim()} onPress={() => void say()} />
         </View>
@@ -1776,8 +1907,8 @@ function MachineDetail(props: { hub: Hub; host: string; wide: boolean; onTask: (
     >
       {mark}
       <Text style={{ fontFamily: MONO, fontSize: 12.5, color: colors.faint }}>{id}</Text>
-      <Text style={{ flex: 1, fontSize: 14.5, color: colors.text, numberOfLines: 1 }}>{title}</Text>
-      <Text style={{ fontSize: 12.5, color: colors.faint, fontVariant: ["tabular-nums"] }}>{right}</Text>
+      <Text style={{ flex: 1, minWidth: 0, fontSize: 14.5, color: colors.text, numberOfLines: 1 }}>{title}</Text>
+      <Text style={{ maxWidth: "50%", minWidth: 0, flexShrink: 1, numberOfLines: 1, fontSize: 12.5, color: colors.faint, fontVariant: ["tabular-nums"] }}>{right}</Text>
     </View>
   );
   return (
@@ -1813,7 +1944,7 @@ function MachineDetail(props: { hub: Hub; host: string; wide: boolean; onTask: (
               <Each of={h()!.accounts ?? []}>
                 {(a) => (
                   <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-                    <Text style={{ flex: 1, fontSize: 14.5, color: colors.text }}>{`${a().cli} · ${a().name}`}</Text>
+                    <Text style={{ flex: 1, fontSize: 14.5, color: colors.text }}>{[a().cli, a().name, a().model].filter(Boolean).join(" · ")}</Text>
                     <Badge label={`${ACCOUNT_STATE()[a().state]?.[0] ?? a().state}${a().until ? L(` until ${a().until!.slice(11, 16)}`, ` 至 ${a().until!.slice(11, 16)}`) : ""}`} tone={ACCOUNT_STATE()[a().state]?.[1] ?? "neutral"} />
                   </View>
                 )}
@@ -1824,7 +1955,7 @@ function MachineDetail(props: { hub: Hub; host: string; wide: boolean; onTask: (
           <If when={h()!.running?.length} else={<Text style={{ fontSize: 14, color: colors.faint }}>{L("Idle", "空闲")}</Text>}>
             <View>
               <Each of={h()!.running ?? []} key={(t) => t.id}>
-                {(t) => row(t().id, t().title, [displayName(t().agent), since(t().started), activityLine(t().activity)?.text].filter(Boolean).join(" · "), <Dot tone="run" />)}
+                {(t) => row(t().id, t().title, [displayName(t().agent), t().activity?.model, since(t().started), activityLine(t().activity)?.text].filter(Boolean).join(" · "), <Dot tone="run" />)}
               </Each>
             </View>
           </If>
@@ -1845,10 +1976,14 @@ function MachineDetail(props: { hub: Hub; host: string; wide: boolean; onTask: (
 
 // ---------------------------------------------------------------- sidebar
 
-function SideHeading(props: { title: string; count?: number | string; accent?: boolean }) {
+/** A section heading; pass `open` to make the section collapsible by clicking the heading. */
+function SideHeading(props: { title: string; count?: number | string; accent?: boolean; open?: Signal<boolean>; testID?: string }) {
+  const o = props.open;
   return (
-    <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: 20, paddingTop: 18, paddingBottom: 6 }}>
-      <Text style={{ flex: 1, fontSize: 12, fontWeight: "600", color: colors.muted, letterSpacing: 0.4 }}>{props.title}</Text>
+    <View testID={props.testID} onPress={o ? () => o.set(!o()) : undefined} role={o ? "button" : undefined} style={{ flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 20, paddingTop: 18, paddingBottom: 6, cursor: o ? "pointer" : undefined }}>
+      <Text style={{ flexShrink: 1, fontSize: 12, fontWeight: "600", color: colors.muted, letterSpacing: 0.4 }}>{props.title}</Text>
+      <If when={o}><Icon name={o?.() ? "chevron-up" : "chevron-down"} size={12} tint={colors.faint} /></If>
+      <View style={{ flex: 1 }} />
       <If when={props.count}>
         <If when={props.accent} else={<Text style={{ fontSize: 12.5, color: colors.faint, fontVariant: ["tabular-nums"] }}>{String(props.count)}</Text>}>
           <View style={{ minWidth: 20, height: 20, paddingHorizontal: 6, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: colors.accentFill }}>
@@ -1946,8 +2081,14 @@ function Sidebar(props: {
   onReadAll: () => void;
   onRestart: () => void;
 }) {
+  /** Archived channels stay folded under one row; the open one stays in place so the selection doesn't vanish. */
+  const showArchived = signal(false);
+  const archivedChannels = () => props.channels.list().filter((c) => c.status === "archived" && c.slug !== props.channel());
   const s = () => props.hub.status();
   // the hub closes a decision on its next tick: one the channel already shows answered leaves the list now
+  // 排队 and 最近 start collapsed; the heading toggles them (owner, T-0987).
+  const queuedOpen = signal(false);
+  const recentOpen = signal(false);
   const waits = computed(() => { const done = answeredIds(props.hub.events()); return waiting(s()).filter((d) => !done.has(d.id)); });
   // the sidebar's right-click menu: end a task that can't go on without opening it
   const endTask = async (id: string, done: boolean) => {
@@ -2066,8 +2207,8 @@ function Sidebar(props: {
           </If>
 
           <If when={(s()?.recent ?? []).filter((t) => !(s()?.active ?? []).some((a) => a.id === t.id) && isQueued(t.state)).length}>
-            <SideHeading title={L("Queued", "排队")} count={(s()?.recent ?? []).filter((t) => !(s()?.active ?? []).some((a) => a.id === t.id) && isQueued(t.state)).length} />
-            <Each of={(s()?.recent ?? []).filter((t) => !(s()?.active ?? []).some((a) => a.id === t.id) && isQueued(t.state))} key={(a) => a.id}>
+            <SideHeading testID="side-queued" open={queuedOpen} title={L("Queued", "排队")} count={(s()?.recent ?? []).filter((t) => !(s()?.active ?? []).some((a) => a.id === t.id) && isQueued(t.state)).length} />
+            <Each of={queuedOpen() ? (s()?.recent ?? []).filter((t) => !(s()?.active ?? []).some((a) => a.id === t.id) && isQueued(t.state)) : []} key={(a) => a.id}>
               {(a) => (
                 <ContextMenu margin={8} popupStyle={menuStyle()} trigger={
                 <SideRow onPress={() => props.onTask(a().id)} selected={props.task() === a().id} title={`${a().id} · ${STATE_OF()[a().state ?? ""]?.[0] ?? ""}`}>
@@ -2082,8 +2223,8 @@ function Sidebar(props: {
             </Each>
           </If>
           <If when={(s()?.recent ?? []).filter((t) => !(s()?.active ?? []).some((a) => a.id === t.id) && !isQueued(t.state)).slice(0, 6).length}>
-            <SideHeading title={L("Recent", "最近")} />
-            <Each of={(s()?.recent ?? []).filter((t) => !(s()?.active ?? []).some((a) => a.id === t.id) && !isQueued(t.state)).slice(0, 6)} key={(a) => a.id}>
+            <SideHeading testID="side-recent" open={recentOpen} title={L("Recent", "最近")} />
+            <Each of={!recentOpen() ? [] : (s()?.recent ?? []).filter((t) => !(s()?.active ?? []).some((a) => a.id === t.id) && !isQueued(t.state)).slice(0, 6)} key={(a) => a.id}>
               {(a) => (
                 <SideRow onPress={() => props.onTask(a().id)} selected={props.task() === a().id} title={`${a().id} · ${STATE_OF()[a().state ?? ""]?.[0] ?? ""}`}>
                   <Dot tone={TONE[a().state ?? ""] ?? "off"} />
@@ -2096,14 +2237,14 @@ function Sidebar(props: {
 
           <If when={props.channels.list().length}>
             <SideHeading title={L("Channels", "Channels")} count={props.channels.list().reduce((n, c) => n + props.channels.unread(c), 0) || undefined} accent />
-            <Each of={props.channels.list()} key={(c) => c.slug}>
+            <Each of={props.channels.list().filter((c) => c.status !== "archived" || c.slug === props.channel())} key={(c) => c.slug}>
               {(c) => (
                 <SideRow onPress={() => props.onChannel(c().slug)} selected={props.channel() === c().slug} title={c().goal || c().name}>
-                  <Text style={{ width: 17, textAlign: "center", fontSize: 15, color: colors.faint }}>#</Text>
+                  <Text style={{ width: 17, textAlign: "right", fontSize: 15, color: colors.faint }}>#</Text>
                   <Text testID={`side-channel-${c().slug}`} style={{ ...rowText(), color: c().status === "archived" || c().stale ? colors.faint : props.channels.unread(c()) ? colors.text : colors.muted, fontWeight: props.channels.unread(c()) ? "600" : "400" }}>{c().name}</Text>
                   <If when={props.channels.unread(c())} else={
-                    <If when={c().status === "archived" || c().stale}>
-                      <Text style={{ fontSize: 12.5, color: colors.faint }}>{c().status === "archived" ? L("Archived", "已归档") : L("Quiet 7d", "7 天无动静")}</Text>
+                    <If when={c().status !== "archived" && c().stale}>
+                      <Text style={{ fontSize: 12.5, color: colors.faint }}>{L("Quiet 7d", "7 天无动静")}</Text>
                     </If>
                   }>
                     <Text testID={`side-channel-unread-${c().slug}`} style={{ fontSize: 12.5, fontWeight: "600", color: colors.accent, fontVariant: ["tabular-nums"] }}>{String(props.channels.unread(c()))}</Text>
@@ -2111,6 +2252,30 @@ function Sidebar(props: {
                 </SideRow>
               )}
             </Each>
+            <If when={archivedChannels().length}>
+              <SideRow onPress={() => showArchived.set(!showArchived())} title={L("Archived channels", "已归档的 Channel")}>
+                <View style={{ width: 17, alignItems: "flex-end" }}><Icon name={showArchived() ? "chevron-down" : "chevron"} size={12} tint={colors.faint} /></View>
+                <Text testID="side-channels-archived" style={{ ...rowText(), color: colors.faint }}>{L("Archived", "已归档")}</Text>
+                <Text style={{ fontSize: 12.5, color: colors.faint, fontVariant: ["tabular-nums"] }}>{String(archivedChannels().length)}</Text>
+              </SideRow>
+              <If when={showArchived()}>
+                <Each of={archivedChannels()} key={(c) => c.slug}>
+              {(c) => (
+                <SideRow onPress={() => props.onChannel(c().slug)} selected={props.channel() === c().slug} title={c().goal || c().name}>
+                  <Text style={{ width: 17, textAlign: "right", fontSize: 15, color: colors.faint }}>#</Text>
+                  <Text testID={`side-channel-${c().slug}`} style={{ ...rowText(), color: c().status === "archived" || c().stale ? colors.faint : props.channels.unread(c()) ? colors.text : colors.muted, fontWeight: props.channels.unread(c()) ? "600" : "400" }}>{c().name}</Text>
+                  <If when={props.channels.unread(c())} else={
+                    <If when={c().status !== "archived" && c().stale}>
+                      <Text style={{ fontSize: 12.5, color: colors.faint }}>{L("Quiet 7d", "7 天无动静")}</Text>
+                    </If>
+                  }>
+                    <Text testID={`side-channel-unread-${c().slug}`} style={{ fontSize: 12.5, fontWeight: "600", color: colors.accent, fontVariant: ["tabular-nums"] }}>{String(props.channels.unread(c()))}</Text>
+                  </If>
+                </SideRow>
+              )}
+                </Each>
+              </If>
+            </If>
           </If>
 
           <SideRow onPress={props.onTasks} selected={props.tasks()} title={L("All tasks", "全部任务")}>
@@ -2148,15 +2313,23 @@ function Sidebar(props: {
           flexDirection: "row",
           alignItems: "center",
           gap: 4,
-          paddingLeft: 18,
-          paddingRight: 10,
+          paddingHorizontal: 10,
           paddingBottom: touch ? safeArea().bottom : 0,
         }}
       >
-        <UserMenu hub={props.hub} onSettings={props.onSettings} reads={props.channels.reads} />
+        <View style={{ flex: 1, minWidth: 0 }}>
+          <UserMenu hub={props.hub} onSettings={props.onSettings} reads={props.channels.reads} />
+        </View>
       </View>
     </View>
   );
+}
+
+/** A fixed colour per initial, so the same account always gets the same avatar colour. */
+function initialColor(ch: string): string {
+  const c = ch.toUpperCase().charCodeAt(0);
+  const index = c >= 65 && c <= 90 ? (c - 65) % 10 + 1 : 10;
+  return token(`avatar-${index}` as "avatar-1");
 }
 
 /** The sidebar account, opening the user menu (settings, appearance, language). */
@@ -2182,8 +2355,8 @@ function UserMenu(props: { hub: Hub; onSettings: () => void; reads: MessageReads
   const sep = () => <MenuSeparator style={{ height: 1, marginVertical: touch ? 6 : 4, marginHorizontal: m.sepX, backgroundColor: alpha(colors.text, 0.07) }} />;
   const initial = () => (account().slice(0, 1) || "?").toUpperCase();
   const avatar = (box: number) => (
-    <View style={{ width: box, height: box, borderRadius: box / 2, flexShrink: 0, alignItems: "center", justifyContent: "center", backgroundColor: alpha(colors.text, 0.08) }}>
-      <Text style={{ fontSize: Math.round(box * 0.44), fontWeight: "600", color: colors.text }}>{initial()}</Text>
+    <View style={{ width: box, height: box, borderRadius: box / 2, flexShrink: 0, alignItems: "center", justifyContent: "center", backgroundColor: initialColor(initial()) }}>
+      <Text style={{ fontSize: Math.round(box * 0.44), fontWeight: "600", color: token("avatar-foreground") }}>{initial()}</Text>
     </View>
   );
   /** One of the two appearances, as a segment whose raised thumb marks the current one. */
@@ -2221,11 +2394,10 @@ function UserMenu(props: { hub: Hub; onSettings: () => void; reads: MessageReads
           testID="user-menu"
           accessibilityLabel={L("Account menu", "用户菜单")}
           hoverStyle={hovered()}
-          style={{ flex: 1, flexDirection: "row", alignItems: "center", gap: 8, minHeight: touch ? 44 : 40, paddingLeft: 6, paddingRight: 8, marginLeft: -6, borderRadius: radius.control, borderCurve: "continuous" }}
+          style={{ width: "100%", flexDirection: "row", alignItems: "center", gap: 8, minHeight: touch ? 44 : 40, paddingLeft: 8, paddingRight: 10, borderRadius: radius.control, borderCurve: "continuous" }}
         >
           {avatar(24)}
           <Text testID="user-account" style={{ flex: 1, fontSize: 13, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{account() || L("Account", "账户")}</Text>
-          <If when={props.reads.unread().length}><Text testID="menu-unread-count" style={{ fontSize: 12, color: colors.accent }}>{String(props.reads.unread().length)}</Text></If>
           <Icon name="chevron-up" size={12} tint={colors.faint} />
         </View>
       }
@@ -2241,7 +2413,7 @@ function UserMenu(props: { hub: Hub; onSettings: () => void; reads: MessageReads
       </View>
       <If when={!touch}>{sep()}</If>
       <View style={touch ? { backgroundColor: colors.surface, borderRadius: 12, borderCurve: "continuous" } : {}}>
-        <MenuItem testID="mark-all-read" disabled={!props.reads.unread().length} onSelect={props.reads.all} hoverStyle={hovered()} activeStyle={hovered()} disabledStyle={{ opacity: 0.4 }} style={row()}>
+        <MenuItem testID="mark-all-read" disabled={!props.reads.main().length} onSelect={props.reads.all} hoverStyle={hovered()} activeStyle={hovered()} disabledStyle={{ opacity: 0.4 }} style={row()}>
           {lead("check")}{label(L("Mark all as read", "全部已读"))}
         </MenuItem>
         <MenuItem testID="settings" onSelect={props.onSettings} hoverStyle={hovered()} activeStyle={hovered()} style={row()}>
@@ -3664,7 +3836,7 @@ const SHORTCUTS = (): [string, string][] => [
   [`1 – 9  ·  ${keymap.label("alt+1")}…`, L("Pick an option on the current decision", "选择当前决策的选项")],
   [`J / K  ·  ${keymap.label("alt+j")} / ${keymap.label("alt+k")}`, L("Next / previous pending decision", "下一个 / 上一个待决策")],
   [`R  ·  ${keymap.label("alt+r")}`, L("Reply to the current decision (other instructions)", "回复当前决策（其他指示）")],
-  [`G  ·  ${keymap.label("alt+g")}`, L("Jump to the latest message", "跳到最新消息")],
+  [`G  ·  ${keymap.label("alt+g")}`, L("Back to bottom", "回到底部")],
   ["Esc", L("Cancel reply / leave the message box / close", "取消回复 / 离开输入框 / 关闭")],
   [keymap.label("mod+,"), L("Team settings", "团队设置")],
   [keymap.label("mod+b"), L("Show / hide sidebar", "显示 / 隐藏侧栏")],
@@ -3731,7 +3903,6 @@ type Route =
   | { name: "routine"; routine: string }
   | { name: "rules" }
   | { name: "tasks" }
-  | { name: "topic"; slug: string }
   | { name: "doc"; path: string };
 const CHANNEL: Route = { name: "channel" };
 
@@ -3780,13 +3951,28 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   const nav = createNavStack<Route>([CHANNEL]);
   const top = () => { const r = nav.routes(); return r[r.length - 1]; };
   const onChannel = () => nav.routes().length === 1;
+  /** The channel the conversation is narrowed to (a Slack-like topic), or null for the main chat. Same view, same composer. */
+  const scope = signal<string | null>(null);
+  effect(() => { const r = top(); readerAt.set(r.name === "task" ? `task:${r.id}` : r.name === "channel" ? `channel:${scope() ?? ""}` : r.name); });
+  const scoped = () => { const slug = scope(); return slug ? channels.list().find((c) => c.slug === slug) : undefined; };
+  const openScope = (slug: string | null) => { drawer.set(false); nav.popToRoot(); scope.set(slug); };
+  // a channel's history beyond what this device holds; what is said there arrives live like the main chat's
+  const channelFeed = signal<HubEvent[]>([]);
+  effect(() => {
+    const slug = scope();
+    scoped()?.last_activity;
+    if (!slug) { channelFeed.set([]); return; }
+    void hub.api("GET", `/api/channels/feed?slug=${encodeURIComponent(slug)}`).then((r) => {
+      if (untracked(scope) === slug && r?.ok && Array.isArray(r.data.events)) channelFeed.set(r.data.events as HubEvent[]);
+    }).catch(() => {});
+  });
   /** Shows a page over the channel, in place of the one shown (the sidebar's pages are siblings). */
   const show = (...routes: Route[]) => { drawer.set(false); nav.setRoutes([CHANNEL, ...routes]); };
   const openHost = (h: string) => show({ name: "host", host: h });
   /** A task: from a machine's page it goes on top (back returns to the machine), else in place. */
   const openTask = (id: string) => {
     const t = untracked(top);
-    if (t.name === "host" || t.name === "tasks" || t.name === "topic") { drawer.set(false); nav.push({ name: "task", id }); }
+    if (t.name === "host" || t.name === "tasks" || (t.name === "channel" && untracked(scope))) { drawer.set(false); nav.push({ name: "task", id }); }
     else show({ name: "task", id });
   };
   taskLink = openTask;
@@ -3798,7 +3984,6 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   // Entering the channel (first load, back from a task or settings) shows the latest messages.
   effect(() => { if (onChannel() && !jumping) { atEnd.set(true); unseen.set(0); toEnd(); } });
   const draft = signal("");
-  const excerpt = signal<{ text: string; ref?: string } | null>(null);
   const replyTo = signal<string | null>(null);
   /** What the reply answers, for the chip ("Kai：nsh #812 主要修的是…"); none for a decision (its id says it). */
   const replyNote = signal<string | null>(null);
@@ -3806,6 +3991,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   const inputHeight = signal(28);
   const outbox = signal<Outgoing[]>([]);
   const atEnd = signal(true);
+  /** The channel's head (name, goal, actions) has scrolled under the bar. */
+  const headPassed = signal(false);
   const unseen = signal(0);
   const chosen = signal<string | null>(null);
 
@@ -3819,39 +4006,83 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   });
 
   /** The timeline: the hub's events and the messages on their way. */
-  const shown = computed(() =>
-    merge(
-      hub.events().filter((e) => !e.thread && !(e.kind === "system" && e.text.startsWith("⚙️ 设置已更新"))),
-      outbox().map((o) => ({
-        id: o.id, ts: o.ts, from: "owner", kind: "owner" as const, text: o.text, ref: o.ref ?? undefined,
-        attachments: o.files.length ? o.files.map((f) => f.preview) : undefined,
-      })),
-    ),
-  );
-  const answered = computed(() => answeredIds(shown()));
-  // "以下为新消息": above the first event from others after what this device last saw.
-  const seen = signal<string | null | undefined>(undefined);
-  Storage.getItem(KEYS.seen).then((v) => seen.set(v ?? null));
+  const shown = computed(() => {
+    const slug = scope();
+    const outgoing = outbox().filter((o) => (o.channel ?? null) === slug).map((o) => ({
+      id: o.id, ts: o.ts, from: "owner", kind: "owner" as const, text: o.text, ref: o.ref ?? undefined, channel: o.channel,
+      attachments: o.files.length ? o.files.map((f) => f.preview) : undefined,
+    }));
+    if (slug) {
+      const ch = untracked(scoped);
+      const refs = scoped()?.refs ?? ch?.items.filter((i) => i.kind !== "report").map((i) => i.id) ?? [];
+      return merge(channelDigest(merge(channelFeed(), hub.events()), refs, slug, Infinity), outgoing);
+    }
+    return merge(hub.events().filter((e) => !e.thread && !e.channel && !(e.kind === "system" && e.text.startsWith("⚙️ 设置已更新"))), outgoing);
+  });
+  // one answer state for every view: the owner may answer a card in the main chat that a channel also shows
+  const answered = computed(() => answeredIds(merge(hub.events(), shown())));
+  /** The newest Markdown report in this conversation: the reader opens it by itself when it arrives. */
+  const latestDoc = computed((): DocRef | null => {
+    const list = shown();
+    for (let i = list.length - 1; i >= 0; i--) {
+      const path = [...(list[i].attachments ?? [])].reverse().find(isDoc);
+      if (path) return { src: mediaUrl(hub.cfg.url, hub.cfg.token, path), name: attachmentName(path) };
+    }
+    return null;
+  });
+  let autoDoc: string | undefined;
+  effect(() => {
+    const d = latestDoc();
+    if (d?.src === autoDoc) return;
+    autoDoc = d?.src;
+    untracked(() => reading.set(d && { ...d, at: `channel:${scope() ?? ""}` }));
+  });
+  // a different hub or a sign-out starts with no reports kept from the last one
+  cleanup(clearDocCache);
+  const readerWide = signal(false);
+  /** Room for the chat beside the reader; below it the reader covers the chat like a sheet. */
+  const chatRoom = () => windowSize().width - (wide() && sidebarOpen() ? size.sidebar : 0);
+  const readerSide = () => wide() && chatRoom() >= 860;
+  const readerWidth = () => (readerWide() ? Math.round(chatRoom() * 0.62) : Math.min(460, Math.round(chatRoom() * 0.42)));
+  const shownDoc = () => { const d = reading(); return d && d.at === readerAt() ? d : null; };
+  const readerPane = () => {
+    const d = shownDoc();
+    if (!d) return null;
+    return <DocPane doc={d} wide={readerSide()} expanded={readerWide()} onExpand={() => { if (!reduceMotion()) LayoutAnimation.configureNext(LayoutAnimation.create(180, "easeInEaseOut")); readerWide.set(!readerWide()); }} onClose={() => reading.set(null)} />;
+  };
   const visibleMessages = signal<HubEvent[]>([]);
   effect(() => {
     if (!reads.loaded() || lifecycle() !== "active") return;
     const route = top();
-    if (onChannel()) reads.read(visibleMessages());
+    if (onChannel()) {
+      // Reading is top-down: everything at or above the newest row on screen counts as read, so rows the
+      // reader scrolled past (or jumped over to the bottom) don't pop back as unread later.
+      const seen = visibleMessages();
+      const newest = seen.reduce((ts, e) => (e.ts > ts ? e.ts : ts), "");
+      reads.read(newest ? untracked(shown).filter((e) => e.ts <= newest) as HubEvent[] : seen);
+    }
     else if (route.name === "task") { hub.events(); reads.ref(route.id); }
   });
+  // "以下为新消息": above the first unread message when entering a view, from the one read record the
+  // main chat and every channel share; fixed for the visit so reading on doesn't move it.
   const divider = signal<string | null | undefined>(undefined);
+  let dividerScope: string | null | undefined;
   effect(() => {
-    if (untracked(divider) !== undefined || !hub.loaded() || seen() === undefined || !reads.loaded()) return;
-    divider.set(firstUnread(shown().filter((e) => !isRead(e, reads.state())), seen() ?? null));
+    const slug = scope();
+    if (!hub.loaded() || !reads.loaded()) return;
+    if (slug && !scoped()) return;
+    if (dividerScope === slug && untracked(divider) !== undefined) return;
+    dividerScope = slug;
+    divider.set(untracked(shown).find((e) => e.kind !== "owner" && !isRead(e, untracked(reads.state)))?.id ?? null);
   });
   // List diffs its items by identity: rebuilt rows would read as all replaced on every new message,
   // losing their measurements and the reader's place. Reuse each row while its event is the same.
-  type TimelineRow = Row | { key: string; unread: true } | { key: string; more: number };
+  type TimelineRow = Row | { key: string; unread: true } | { key: string; more: number } | { key: string; head: string };
   /** The newest messages shown; older ones wait behind 「加载更早的消息」 so the list stays short. */
   const PAGE = 200;
   const limit = signal(PAGE);
   let built = new Map<string, TimelineRow>();
-  const timelineWindow = createTimelineWindow(PAGE);
+  let timelineWindow = createTimelineWindow(PAGE);
   const UNREAD: TimelineRow = { key: "unread", unread: true };
   const timeline = computed((): TimelineRow[] => {
     const d = divider();
@@ -3859,6 +4090,14 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
     const out: TimelineRow[] = [];
     const all = shown();
     const hidden = timelineWindow.update(all, hub.loaded(), limit(), untracked(atEnd) && untracked(onChannel));
+    // a channel's head stays the first row, above any older history still to load, so its name, goal and actions are always at the top
+    const slug = scope();
+    if (slug) {
+      const key = `head:${slug}`;
+      const head = built.get(key) ?? { key, head: slug };
+      next.set(key, head);
+      out.push(head);
+    }
     if (hidden) {
       const old = built.get("more");
       const more = old && "more" in old && old.more === hidden ? old : { key: "more", more: hidden };
@@ -3887,10 +4126,14 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   let scroller: ListRef | undefined;
   let composer: InputRef | undefined;
 
+  let count = 0;
   const toEnd = (animated = false) => setTimeout(() => scroller?.scrollToEnd({ animated }), 40);
+  // Switching between the main chat and a channel (or channel to channel) is entering too: start at the latest message.
+  effect(() => { scope(); if (untracked(onChannel) && !jumping) { atEnd.set(true); unseen.set(0); toEnd(); } });
+  // A channel's history arrives after the switch; land on its end unless the reader has scrolled up meanwhile.
+  effect(() => { channelFeed(); if (untracked(atEnd) && !jumping) toEnd(); });
   // The list follows its end by itself (alignment="bottom"); scrolled further up than AT_END, it stays put and this counts what came below.
   const AT_END = 24;
-  let count = 0;
   effect(() => {
     const n = shown().length;
     const grew = n > count;
@@ -3899,10 +4142,58 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   });
   /** What the floating composer covers at the bottom of the timeline. */
   const composerHeight = signal(0);
+  // Keep every explicit timeline jump short, including off-screen decision cards.
+  // Stage the target one viewport away, let recycled rows lay out, then use the
+  // platform's smooth scroll for the final screen instead of traversing the history.
+  let firstVisibleRow = -1;
+  let lastVisibleRow = -1;
+  let timelineHeight = 600;
+  let jumpVersion = 0;
+  const cancelJump = () => { jumpVersion++; };
+  cleanup(cancelJump);
+  function scrollTimeline(index: number, end = false) {
+    const list = scroller;
+    if (!list || index < 0) return;
+    const version = ++jumpVersion;
+    const animated = !reduceMotion();
+    const finish = () => {
+      if (version !== jumpVersion || scroller !== list) return;
+      if (end) list.scrollToEnd({ animated });
+      else list.scrollToIndex({ index, viewOffset: 24, animated });
+    };
+    const far = firstVisibleRow >= 0 && (index < firstVisibleRow - 1 || index > lastVisibleRow + 1);
+    if (!animated || !far) { finish(); return; }
+    const direction = index > lastVisibleRow ? 1 : -1;
+    list.scrollToIndex({
+      index, viewPosition: end ? 1 : 0,
+      viewOffset: (end ? 0 : 24) + direction * timelineHeight,
+      animated: false,
+    });
+    requestAnimationFrame(() => requestAnimationFrame(finish));
+  }
   const jumpToEnd = () => {
     unseen.set(0);
-    atEnd.set(true);
-    toEnd(true);
+    scrollTimeline(untracked(timeline).length - 1, true);
+  };
+  // another channel is another conversation: its own window, its own page of history, opened at its latest
+  let windowScope: string | null = null;
+  effect(() => {
+    const slug = scope();
+    if (slug === windowScope) return;
+    windowScope = slug;
+    timelineWindow = createTimelineWindow(PAGE);
+    built = new Map();
+    limit.set(PAGE);
+    headPassed.set(false);
+    atEnd.set(true); unseen.set(0); count = untracked(shown).length; toEnd();
+  });
+  // Pages whose head has scrolled under the bar, which then carries a compact title instead; back at the head it unfolds.
+  const taskFolds = signal<Record<string, Folded | null>>({});
+  const folded = (r: Route): Folded | null => {
+    if (r.name === "task") return taskFolds()[r.id] ?? null;
+    if (r !== CHANNEL || !headPassed() || !scope()) return null;
+    const c = scoped();
+    return { title: `# ${c?.name ?? scope()}`, detail: c?.goal ?? "", reveal: () => scrollTimeline(0) };
   };
 
   const reply = (ref: string, note?: string) => {
@@ -3917,7 +4208,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   const holds = new Map<string, ReturnType<typeof setTimeout>>();
   function send(text: string, ref: string | null, id = `local:${crypto.randomUUID()}`, files: Attachment[] = []) {
     const ts = new Date().toISOString();
-    outbox.update((o) => [...o.filter((x) => x.id !== id), { id, ts, text, ref, files, state: "held" }]);
+    const channel = untracked(scope) ?? undefined;
+    outbox.update((o) => [...o.filter((x) => x.id !== id), { id, ts, text, ref, files, state: "held", channel }]);
     jumpToEnd();
     holds.set(id, setTimeout(() => { holds.delete(id); void deliver(id); }, UNDO_MS));
   }
@@ -3962,10 +4254,10 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   async function deliver(id: string) {
     const o = outbox().find((x) => x.id === id);
     if (!o || o.state === "sending") return;
-    const { text, ref, files } = o;
+    const { text, ref, files, channel } = o;
     outbox.update((l) => l.map((x) => (x.id === id ? { ...x, state: "sending" } : x)));
     try {
-      markSent(await hub.send(text, ref, files, false, id));
+      markSent(await hub.send(text, ref, files, false, id, channel));
       outbox.update((o) => o.filter((x) => x.id !== id));
     } catch {
       outbox.update((o) => o.map((x) => (x.id === id ? { ...x, state: "failed" } : x)));
@@ -3996,8 +4288,6 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
     const r = replyTo() ?? (!files.length && /^([1-9](\s*[,，]\s*[1-9])*|[A-Za-z]|全部|都不要)$/.test(v) ? target() : null);
     draft.set("");
     replyTo.set(null);
-    selectionGeneration++;
-    excerpt.set(null);
     attachments.set([]);
     attachNote.set(null);
     inputHeight.set(28);
@@ -4007,7 +4297,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   // Images the owner attaches: pasted, dropped on the window, or picked.
   const attachments = signal<Attachment[]>([]);
   const attachNote = signal<string | null>(null);
-  const dropping = signal(false);
+  // A file drag over the window: null when none, else the offered files (empty until the shell reports them).
+  const dropping = signal<string[] | null>(null);
   let attachSeq = 0;
   function attach(file: Blob, name: string, fromPicker = false) {
     // the photo picker only returns images, but phones often give them no type or extension; the server reads the bytes
@@ -4161,6 +4452,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
     atEnd.set(false);
     const back = !untracked(onChannel);
     nav.popToRoot();
+    if (untracked(scope) && !untracked(shown).some((e) => e.ref === ref)) scope.set(null);
     chosen.set(ref);
     clearNotification(ref);
     // back from another page the channel lays out first
@@ -4172,7 +4464,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
     if (at >= 0 && shown().length - at > untracked(limit)) limit.set(shown().length - at); // older than the page: show it
     const index = timeline().findIndex((row) => "event" in row && row.event.ref === ref && isAsk(row.event));
     if (index >= 0 && scroller) {
-      scroller.scrollToIndex({ index, animated: true, viewOffset: 24 });
+      scrollTimeline(index);
       if (jumping === ref) jumping = null;
     } else if (tries > 0 && !scroller) {
       setTimeout(() => toCard(ref, tries - 1), 80);
@@ -4247,12 +4539,6 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
       for (const id of [...showing]) if (done.has(id)) closeNotification(id);
     });
   }
-  // This device has seen what reached the bottom.
-  effect(() => {
-    const evs = shown();
-    if (!atEnd() || !evs.length || divider() === undefined) return;
-    Storage.setItem(KEYS.seen, evs[evs.length - 1].ts);
-  });
   // A new decision while the app is open: a quiet toast and a short vibration.
   const toast = signal<{ ref: string; text: string } | null>(null);
   let known: Set<string> | null = null;
@@ -4341,8 +4627,6 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
     else if (nav.routes().length > 1) nav.pop();
   }, { when: "always" });
 
-  const connLabel = () => ({ connecting: L("Connecting…", "连接中…"), live: L("Live", "实时"), offline: L("Disconnected, reconnecting…", "已断开，重连中…"), unauthorized: L("Session expired", "登录已过期"), blocked: L(`IP ${hub.blockedIp()} not allowed`, `IP ${hub.blockedIp()} 未放行`) })[hub.conn()];
-  const connTone = () => (hub.conn() === "live" ? "on" : hub.conn() === "unauthorized" || hub.conn() === "blocked" ? "bad" : hub.conn() === "offline" ? "wait" : "off");
   const sidebar = (inDrawer: boolean) => (
     <Sidebar
       onRestart={() => void restartToUpdate()}
@@ -4360,44 +4644,49 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
       tasks={() => top().name === "tasks"}
       onTasks={() => show({ name: "tasks" })}
       channels={channels}
-      channel={() => { const t = top(); return t.name === "topic" ? t.slug : null; }}
-      onChannel={(slug) => show({ name: "topic", slug })}
+      channel={() => (onChannel() ? scope() : null)}
+      onChannel={(slug) => openScope(slug)}
       onHelp={() => help.set(true)}
       onClose={inDrawer ? () => drawer.set(false) : undefined}
       chrome={!inDrawer}
       onCollapse={inDrawer ? undefined : () => setSidebarOpen(false)}
-      home={onChannel}
-      unread={() => reads.unread().length}
+      home={() => onChannel() && !scope()}
+      unread={() => reads.main().length}
       onReadAll={reads.all}
-      onHome={() => { drawer.set(false); nav.popToRoot(); }}
+      onHome={() => openScope(null)}
     />
   );
+  // Only a touchscreen swipes the sidebar in: a pan handler takes every mouse press on the web,
+  // so dragging over a message would select nothing.
+  const swipeDrawer = () => touch && !wide() && !drawer();
   /** The channel: the timeline and the composer. */
   const channelPage = () => (
-      <View testID="channel-swipe" pan={!wide() && !drawer() ? { x: drawerX } : undefined}
-        onPanStart={() => { if (!wide() && !drawer()) drawerDragging.set(true); }}
-        onPanEnd={finishDrawerPan}
+    <View style={{ flex: 1, flexDirection: "row", minWidth: 0 }}>
+      <View testID="channel-swipe" pan={swipeDrawer() ? { x: drawerX } : undefined}
+        onPanStart={swipeDrawer() ? () => drawerDragging.set(true) : undefined}
+        onPanEnd={swipeDrawer() ? finishDrawerPan : undefined}
         style={{ flex: 1, backgroundColor: colors.background, paddingBottom: keyboardFrame().height, transitionProperty: "padding-bottom", transitionDuration: keyboardFrame().duration }}>
-          {/* Files dropped on the timeline or the composer attach their images. */}
           <View
             testID="composer-area"
-            onFileDragEnter={() => dropping.set(true)}
-            onFileDragLeave={() => dropping.set(false)}
-            onFileDrop={({ uris }) => { dropping.set(false); void attachUris(uris); }}
             style={{ flex: 1 }}
           >
             <List
               testID="timeline"
               each={timeline()}
               viewabilityConfig={{ minimumViewTime: 300 }}
-              onViewableItemsChange={({ viewableItems }) => visibleMessages.set(viewableItems.flatMap((t) => "event" in t.item ? [t.item.event] : []))}
+              onViewableItemsChange={({ viewableItems }) => {
+                firstVisibleRow = viewableItems.reduce((m, t) => Math.min(m, t.index ?? Infinity), Infinity);
+                lastVisibleRow = viewableItems.reduce((m, t) => Math.max(m, t.index ?? -1), -1);
+                visibleMessages.set(viewableItems.flatMap((t) => "event" in t.item ? [t.item.event] : []));
+              }}
               alignment="bottom"
               maintainVisibleContentPosition={{ autoscrollToBottomThreshold: AT_END }}
               estimatedItemSize={120}
               contentStyle={{ paddingTop: wide() ? 24 : 12, paddingBottom: composerHeight() + 16 }}
               keyExtractor={(row) => row.key}
               ref={(r) => { scroller = r; }}
-              onTouchStartCapture={() => { if (platform.os === "macos" && focused()) composer?.blur(); }}
+              onLayout={({ bounds }) => { timelineHeight = Math.max(1, bounds.size.height); }}
+              onTouchStartCapture={() => { cancelJump(); if (platform.os === "macos" && focused()) composer?.blur(); }}
               style={{ flex: 1 }}
               scrollEventThrottle={100}
               keyboardShouldPersistTaps="handled"
@@ -4405,6 +4694,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                 const end = ev.contentSize.height - ev.offset.y - ev.size.height <= AT_END;
                 if (end !== untracked(atEnd)) atEnd.set(end);
                 if (end) unseen.set(0);
+                const passed = ev.offset.y > (wide() ? 24 : 12) + CHANNEL_HEAD;
+                if (passed !== untracked(headPassed)) headPassed.set(passed);
               }}
               empty={() => <View style={{ width: "100%", maxWidth: size.column + gutter() * 2, alignSelf: "center", paddingHorizontal: gutter(), paddingTop: wide() ? 24 : 12, paddingBottom: composerHeight() + 16 }}>
                 <If when={!hub.loaded()}>
@@ -4436,6 +4727,19 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                 <Each of={[item()]} key={(r) => r.key}>
                   {(r) => {
                     const row = r();
+                    if ("head" in row) {
+                      return (
+                        <View>
+                          <ChannelHeader channels={channels} slug={row.head} />
+                          <If when={shown().length === 0}>
+                            <View testID="channel-empty" style={{ gap: 6, paddingVertical: 16 }}>
+                              <Text style={{ fontSize: 16, fontWeight: "600", color: colors.text }}>{L(`This is the start of #${scoped()?.name ?? row.head}`, `这里是 #${scoped()?.name ?? row.head} 的开始`)}</Text>
+                              <Text style={{ fontSize: 14, lineHeight: 21, color: colors.muted }}>{L("Results and decisions for this topic land here. What you say here stays here, out of the main chat.", "这个话题的结果和决策会出现在这里。在这里说的话只留在这里，不进主会话。")}</Text>
+                            </View>
+                          </If>
+                        </View>
+                      );
+                    }
                     if ("more" in row) {
                       return (
                         <View style={{ alignItems: "center", marginTop: 16, marginBottom: 4 }}>
@@ -4461,13 +4765,21 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                         </View>
                       );
                     }
-                    const entrance = timelineWindow.takeArrival(row.event.id) ? createMotion({
-                      enter: { keyframes: { opacity: [0, 1], translateY: [8, 0] }, duration: 180, easing: "easeOut" },
-                    }) : undefined;
+                    const arriving = timelineWindow.takeArrival(row.event.id) && !reduceMotion();
                     if (row.event.kind === "owner") {
                       const out = () => outbox().find((o) => o.id === row.event.id);
-                      return <View style={entrance?.style}><OwnerBubble hub={hub} event={row.event} out={out()} onRetry={() => void deliver(row.event.id)} onRecall={() => undo(row.event.id)} onRef={pick} /></View>;
+                      // Just sent from the composer below: the bubble rises out of the input into its place.
+                      const sent = arriving && untracked(out) !== undefined;
+                      const entrance = arriving ? createMotion({
+                        enter: sent
+                          ? { keyframes: { opacity: [0, 1], translateY: [Math.min(composerHeight(), 120), 0], scale: [0.92, 1] }, duration: 260, easing: "easeOut" }
+                          : { keyframes: { opacity: [0, 1], translateY: [8, 0] }, duration: 180, easing: "easeOut" },
+                      }) : undefined;
+                      return <View testID={sent ? "sent-entrance" : undefined} style={[entrance?.style ?? null, { transformOrigin: "right bottom" }]}><OwnerBubble hub={hub} event={row.event} out={out()} onRetry={() => void deliver(row.event.id)} onRecall={() => undo(row.event.id)} onRef={pick} /></View>;
                     }
+                    const entrance = arriving ? createMotion({
+                      enter: { keyframes: { opacity: [0, 1], translateY: [8, 0] }, duration: 180, easing: "easeOut" },
+                    }) : undefined;
                     return (
                       <View style={entrance?.style}>
                         <Message
@@ -4477,7 +4789,6 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                           target={target}
                           onAnswer={answer}
                           onReply={reply}
-                          onQuote={(text, ref) => excerpt.set({ text, ref })}
                           selection={proposalSelection}
                           unread={() => reads.loaded() && !isRead(row.event, reads.state())}
                           onToggleRead={() => reads.toggle(row.event)}
@@ -4494,7 +4805,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
               <View style={{ position: "absolute", left: 0, right: 0, bottom: composerHeight() + 4, paddingVertical: 4, alignItems: "center", pointerEvents: "box-none" }}>
                 <View
                   role="button"
-                  accessibilityLabel={L("Jump to latest", "跳到最新")}
+                  accessibilityLabel={L("Back to bottom", "回到底部")}
                   onPress={jumpToEnd}
                   hoverStyle={{ opacity: 0.92 }}
                   style={{
@@ -4513,7 +4824,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                 >
                   <Icon name="arrow-down" size={15} tint={unseen() ? colors.onAccent : colors.text} />
                   <Text style={{ fontSize: 14, fontWeight: "600", color: unseen() ? colors.onAccent : colors.text }}>
-                    {unseen() ? L(`${unseen()} new messages`, `${unseen()} 条新消息`) : L("Jump to latest", "跳到最新")}
+                    {unseen() ? L(`${unseen()} new messages`, `${unseen()} 条新消息`) : L("Back to bottom", "回到底部")}
                   </Text>
                   <If when={!touch}>
                     <Text style={{ fontSize: 12, color: unseen() ? alpha(colors.onAccent, 0.7) : colors.faint }}>G</Text>
@@ -4561,16 +4872,6 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                   </If>
                 </View>
               </If>
-              <QuotePreview text={excerpt()?.text ?? ""} onCancel={() => excerpt.set(null)} onQuote={() => {
-                const selected = excerpt();
-                if (!selected) return;
-                excerpt.set(null);
-                draft.update((value) => appendQuote(value, selected.text));
-                replyNote.set(null);
-                replyTo.set(selected.ref ?? null);
-                composer?.focus();
-                composer?.setSelection(draft().length);
-              }} />
               <If when={slash() != null}>
                 <CommandList
                   items={commands()}
@@ -4594,7 +4895,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                   paddingLeft: 18,
                   paddingRight: 8,
                   ...composerGlass(focused()),
-                  ...(dropping() ? { borderColor: colors.accent, borderStyle: "dashed" as const } : {}),
+                  ...(dropping() && onChannel() ? { borderColor: colors.accent, borderStyle: "dashed" as const } : {}),
                 }}
               >
                 <If when={replyTo()}>
@@ -4671,11 +4972,11 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                     focused.set(false);
                   }}
                   onContentSizeChange={({ size: s }) => inputHeight.set(Math.min(220, Math.max(28, s.height)))}
-                  placeholder={replyTo() ? L(`Reply to ${replyTo()}…`, `回复 ${replyTo()}…`) : wide() ? L("Tell the team what to do, e.g. screenshot and check the nsh gallery on Linux", "给团队下指令，例如：把 nsh 的 gallery 在 Linux 上截图检查一遍") : L("Tell the team what to do…", "给团队下指令…")}
+                  placeholder={replyTo() ? L(`Reply to ${replyTo()}…`, `回复 ${replyTo()}…`) : scope() ? L(`Message #${scoped()?.name ?? scope()}`, `在 #${scoped()?.name ?? scope()} 里讨论…`) : wide() ? L("Tell the team what to do, e.g. screenshot and check the nsh gallery on Linux", "给团队下指令，例如：把 nsh 的 gallery 在 Linux 上截图检查一遍") : L("Tell the team what to do…", "给团队下指令…")}
                   class={platform.os === "ios" ? "placeholder:text-muted-foreground" : "placeholder:text-faint"}
                   style={{
                     height: compactComposer() ? (touch ? 44 : 36) : inputHeight(),
-                    marginLeft: compactComposer() ? (touch ? 44 : 36) - 2 : 0,
+                    marginLeft: compactComposer() ? (touch ? 44 : 36) - 2 + (hasEmojiPicker ? (touch ? 44 : 36) + 6 : 0) : 0,
                     marginRight: compactComposer() && canDictate() ? (touch ? 44 : 36) + 8 : 0,
                     minWidth: 0, fontSize: size.text, lineHeight: 24, color: colors.text,
                     paddingVertical: compactComposer() ? (touch ? 10 : 6) : 2,
@@ -4695,6 +4996,24 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                     >
                       <Icon name="plus" size={touch ? 22 : 18} tint={colors.text} />
                     </View>
+                    <ComposerEmoji
+                      touch={touch}
+                      onOpen={() => {
+                        if (untracked(speech) !== "off") stopDictation(true);
+                        if (touch) composer?.blur();
+                      }}
+                      onSelect={(emoji) => {
+                        const value = draft();
+                        const start = Math.min(caret?.start ?? value.length, value.length);
+                        const end = Math.min(Math.max(caret?.end ?? start, start), value.length);
+                        draft.set(value.slice(0, start) + emoji + value.slice(end));
+                        caret = { start: start + emoji.length, end: start + emoji.length };
+                      }}
+                      onInserted={() => {
+                        composer?.focus();
+                        if (caret) composer?.setSelection(caret.start, caret.end);
+                      }}
+                    />
                     <If when={speech() !== "off"}>
                       <Text testID="dictating" style={{ fontSize: 13, color: colors.accent, numberOfLines: 1 }}>
                         {speech() === "on" ? L("Listening…", "正在听…") : L("Recognizing…", "正在识别…")}
@@ -4734,16 +5053,28 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
           </View>
           </View>
       </View>
+    </View>
+  );
+  /** Any page with report cards (the channel, a task) gets the same reader beside it, or over it on a phone. */
+  const withReader = (page: JSX.Element) => (
+    <View style={{ flex: 1, flexDirection: "row", minWidth: 0 }}>
+      {page}
+      <If when={shownDoc() && readerSide()}>
+        <View testID="doc-side" style={{ width: readerWidth(), borderLeftWidth: 0.5, borderColor: colors.line }}>{readerPane()}</View>
+      </If>
+      <If when={shownDoc() && !readerSide()}>
+        <View testID="doc-sheet" style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, paddingBottom: safeArea().bottom, backgroundColor: colors.background }}>{readerPane()}</View>
+      </If>
+    </View>
   );
 
   const gutter = () => (wide() ? 32 : 16);
   const titleOf = (r: Route): string => {
     switch (r.name) {
-      case "channel": return L("Channel", "主会话");
+      case "channel": return scope() ? `# ${scoped()?.name ?? scope()}` : L("Channel", "主会话");
       case "team": return wide() ? L("Team settings", "团队设置") : L("Settings", "设置");
       case "task": return L(`Task ${r.id}`, `任务 ${r.id}`);
       case "tasks": return L("All tasks", "全部任务");
-      case "topic": return `# ${channels.list().find((c) => c.slug === r.slug)?.name ?? r.slug}`;
       case "host": return L(`Machine ${r.host}`, `机器 ${r.host}`);
       case "notify": return L("Notifications", "通知");
       case "member": return displayName(r.id);
@@ -4755,16 +5086,20 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   /** The back button's label, the page below's short name. */
   const backTitle = (r: Route | undefined) => (!r ? "" : r.name === "channel" ? L("Channel", "主会话") : r.name === "team" ? L("Settings", "设置") : r.name === "host" ? L("Machines", "机器") : r.name === "rules" ? L("Memory", "记忆") : r.name === "tasks" ? L("All tasks", "全部任务") : titleOf(r));
   const below = (r: Route) => { const rs = nav.routes(); const i = rs.indexOf(r); return i > 0 ? rs[i - 1] : undefined; };
-  const connPill = () => (
+  /** A folded page's compact title in its bar: pressing it scrolls back to the head. Centered in two lines in a phone's system header. */
+  const FoldedTitle = (p: { folded: Folded; stacked?: boolean }) => (
     <View
-      tooltip={<Tip label={hub.cfg.url} />}
-      accessibilityLabel={connLabel()}
-      testID="conn"
-      style={{ flexDirection: "row", alignItems: "center", gap: 7, height: 30, paddingHorizontal: wide() ? 10 : 11 }}
+      testID="page-title-folded"
+      role="button"
+      accessibilityLabel={L(`${p.folded.title}, back to the top`, `${p.folded.title}，回到顶部`)}
+      onPress={() => p.folded.reveal()}
+      style={p.stacked
+        ? { minWidth: 0, maxWidth: "100%", alignItems: platform.os === "ios" ? "center" : "flex-start" }
+        : { flexShrink: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 8 }}
     >
-      <Dot tone={connTone()} />
-      <If when={wide()}>
-        <Text style={{ fontSize: 13.5, color: hub.conn() === "unauthorized" ? colors.danger : colors.muted }}>{connLabel()}</Text>
+      <Text style={{ flexShrink: 1, minWidth: 0, maxWidth: "100%", fontSize: 16, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{p.folded.title}</Text>
+      <If when={p.folded.detail}>
+        <Text testID="page-title-detail" style={{ flexShrink: 4, minWidth: 0, maxWidth: "100%", fontSize: p.stacked ? 12.5 : 13.5, color: colors.muted, numberOfLines: 1 }}>{p.folded.detail}</Text>
       </If>
     </View>
   );
@@ -4806,9 +5141,13 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
         )}
       </If>
       <View style={{ flex: 1, flexDirection: "row", alignItems: "center", gap: 8, minWidth: 0 }}>
-        <Text style={{ fontSize: 16, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{titleOf(p.route)}</Text>
+        <If when={folded(p.route)} else={<Text testID="page-title" style={{ fontSize: 16, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{titleOf(p.route)}</Text>}>
+          {(f) => <FoldedTitle folded={f()} />}
+        </If>
       </View>
-      {connPill()}
+      <If when={p.route === CHANNEL && !shownDoc() && latestDoc()}>
+        <ToolButton icon="document" label={L("Open latest report", "打开最新报告")} onPress={() => { const d = latestDoc(); reading.set(d && { ...d, at: readerAt() }); }} testID="doc-reopen" />
+      </If>
       <If when={!wide() && p.route === CHANNEL}>
         <ToolButton icon="sliders" label={L("Settings", "设置")} onPress={openTeam} testID="settings-top" />
       </If>
@@ -4816,10 +5155,9 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   );
   const content = (r: Route) => {
     switch (r.name) {
-      case "channel": return channelPage();
-      case "task": return <TaskDetail hub={hub} id={r.id} wide={wide()} />;
+      case "channel": return withReader(channelPage());
+      case "task": return withReader(<TaskDetail hub={hub} id={r.id} wide={wide()} onFold={(f) => taskFolds.update((m) => ({ ...m, [r.id]: f }))} />);
       case "tasks": return <TaskHistory hub={hub} wide={wide()} onTask={openTask} />;
-      case "topic": return <ChannelPage hub={hub} channels={channels} slug={r.slug} wide={wide()} onTask={openTask} onPick={pick} onDoc={(path) => nav.push({ name: "doc", path })} />;
       case "host": return <MachineDetail hub={hub} host={r.host} wide={wide()} onTask={openTask} />;
       case "team":
         return (
@@ -4839,7 +5177,18 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   };
 
   return (
-    <View style={{ flex: 1, flexDirection: "row", backgroundColor: colors.sidebar, overflow: "hidden" }}>
+    <View
+      testID="drop-window"
+      onFileDragEnter={(e?: { uris?: string[] }) => dropping.set(e?.uris ?? [])}
+      onFileDragLeave={() => dropping.set(null)}
+      onFileDrop={({ uris }) => {
+        dropping.set(null);
+        // files land in the chat composer: from a task or doc page, go back to the chat first
+        if (!onChannel()) nav.popToRoot();
+        void attachUris(uris);
+      }}
+      style={{ flex: 1, flexDirection: "row", backgroundColor: colors.sidebar, overflow: "hidden" }}
+    >
       <If when={platform.os === "macos" && wide() && sidebarOpen()}>
         <View style={{ position: "absolute", top: 0, bottom: 0, left: 0, width: size.sidebar + 20, ...glass(colors.sidebar, 0), backgroundColor: alpha(colors.sidebar, 0.25), borderWidth: 0, boxShadow: "none", pointerEvents: "none" }} />
       </If>
@@ -4862,26 +5211,10 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
             headerLeft={systemHeader && route === CHANNEL && !wide() ? <ToolButton icon="menu" label={L("Menu", "菜单")} onPress={() => drawer.set(true)} /> : undefined}
             ios={{ headerLeftSymbol: "sidebar.left", headerRightSymbol: "gearshape" }}
             headerTitle={
-              // iOS: the bar's buttons are UIKit's own, so the connection sits by the title.
-              platform.os === "ios" && route === CHANNEL ? (
-                <View testID="conn" accessibilityLabel={connLabel()} style={{ flexDirection: "row", alignItems: "center", gap: 7 }}>
-                  <Dot tone={connTone()} />
-                  <Text style={{ fontSize: 17, fontWeight: "600", color: colors.text }}>{titleOf(route)}</Text>
-                </View>
-              ) : undefined
+              // phones: a folded page's compact title replaces the system title until its head is back in sight
+              systemHeader && folded(route) ? <FoldedTitle folded={folded(route)!} stacked /> : undefined
             }
-            headerRight={
-              platform.os === "ios" ? (
-                route === CHANNEL ? <ToolButton icon="sliders" label={L("Settings", "设置")} onPress={openTeam} testID="settings-top" /> : undefined
-              ) : systemHeader ? (
-                <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-                  {connPill()}
-                  <If when={route === CHANNEL}>
-                    <ToolButton icon="sliders" label={L("Settings", "设置")} onPress={openTeam} testID="settings-top" />
-                  </If>
-                </View>
-              ) : undefined
-            }
+            headerRight={systemHeader && route === CHANNEL ? <ToolButton icon="sliders" label={L("Settings", "设置")} onPress={openTeam} testID="settings-top" /> : undefined}
             style={{ backgroundColor: colors.background }}
           >
             {content(route)}
@@ -4896,41 +5229,72 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
       <SettingsToast state={settings.toast} />
       <If when={toast()}>
         {(t) => (
-          <View style={{ position: "absolute", top: size.bar + 10, left: 0, right: 0, alignItems: "center", paddingHorizontal: 12, pointerEvents: "box-none" }}>
-            <View
-              role="button"
-              testID="toast"
-              accessibilityLabel={L(`View ${t().ref}`, `查看 ${t().ref}`)}
-              onPress={() => {
-                const ref = t().ref; // read before clearing: the toast's accessor is null after set(null)
-                toast.set(null);
-                pick(ref);
-              }}
-              style={{
-                maxWidth: 520,
-                flexDirection: "row",
-                alignItems: "center",
-                gap: 10,
-                paddingVertical: 10,
-                paddingHorizontal: 14,
-                borderRadius: 14,
-                borderWidth: 1,
-                borderColor: colors.border,
-                backgroundColor: colors.surface,
-                boxShadow: "0 10px 30px rgba(0,0,0,0.16)",
-              }}
-            >
-              <Dot tone="wait" />
-              <Text style={{ flexShrink: 1, fontSize: 14.5, color: colors.text, numberOfLines: 1 }}>
-                <Text style={{ fontWeight: "600" }}>{L(`New decision ${t().ref}`, `新决策 ${t().ref}`)}</Text> · {t().text}
-              </Text>
-              <Text style={{ fontSize: 14, fontWeight: "600", color: colors.accent }}>{L("View", "查看")}</Text>
-            </View>
-          </View>
+          <Overlay style={{ top: touch ? safeArea().top + 8 : size.bar + 10, left: 0, right: 0, alignItems: "center", paddingHorizontal: 12, pointerEvents: "box-none" }}>
+            <ToastStack placement="topCenter" onCancel={() => toast.set(null)}
+              motion={reduceMotion() ? { duration: 0 } : undefined}
+              style={{ width: "100%", maxWidth: 520 }}>
+              <Toast testID="decision-notification" transitionStatus="present" swipeDirection="up"
+                accessibilityLabel={L(`New decision ${t().ref}: ${t().text}`, `新决策 ${t().ref}：${t().text}`)}
+                onDismissRequest={() => toast.set(null)}
+                style={{ width: "100%", flexDirection: "row", alignItems: "flex-start", borderRadius: radius.card,
+                  borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface,
+                  boxShadow: "0 4px 16px rgba(0,0,0,0.12)" }}>
+                <Button testID="toast" accessibilityLabel={L(`View ${t().ref}`, `查看 ${t().ref}`)}
+                  class="focus-visible:ring-2 focus-visible:ring-ring active:opacity-70"
+                  onPress={() => {
+                    const ref = t().ref;
+                    toast.set(null);
+                    pick(ref);
+                  }}
+                  style={{ flex: 1, minWidth: 0, minHeight: 44, padding: 12, alignItems: "stretch", gap: 4 }}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                    <Dot tone="wait" />
+                    <Text style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: "600", color: colors.muted, numberOfLines: 1 }}>
+                      {L(`New decision ${t().ref}`, `新决策 ${t().ref}`)}
+                    </Text>
+                  </View>
+                  <Text style={{ fontSize: 16, color: colors.text, numberOfLines: 2 }}>{shortGitHubRefs(t().text)}</Text>
+                </Button>
+                <Button testID="dismiss-decision-notification" accessibilityLabel={L("Dismiss notification", "关闭通知")}
+                  onPress={() => toast.set(null)} class="focus-visible:ring-2 focus-visible:ring-ring active:opacity-70"
+                  style={{ width: 44, height: 44, flexShrink: 0, alignItems: "center", justifyContent: "center" }}>
+                  <Icon name="close" size={16} tint={colors.muted} />
+                </Button>
+              </Toast>
+            </ToastStack>
+          </Overlay>
         )}
       </If>
 
       <HelpSheet open={help()} onClose={() => help.set(false)} />
+      <If when={dropping()}>
+        {(files) => <DropTarget files={files()} />}
+      </If>
+    </View>
+  );
+}
+
+/** What a file drag over the window shows: the whole window becomes the target, saying what the drop will do. */
+function DropTarget(props: { files: string[] }) {
+  const names = () => props.files.map((u) => { const n = u.split(/[\\/]/).pop() ?? ""; try { return decodeURIComponent(n); } catch { return n; } });
+  const images = () => names().filter((n) => imageType(undefined, n)).length;
+  const detail = () => {
+    const n = names().length;
+    if (n === 0) return L("Images are added to the message", "图片会添加到消息中");
+    if (images() === 0) return L("Only images can be sent", "只能发送图片");
+    if (images() < n) return L(`${images()} of ${n} files are images`, `${n} 个文件中有 ${images()} 张图片`);
+    return n === 1 ? names()[0] : L(`${n} images`, `${n} 张图片`);
+  };
+  const ok = () => names().length === 0 || images() > 0;
+  return (
+    <View testID="drop-target" style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0, padding: 12, pointerEvents: "none" }}>
+      <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: 12, borderRadius: 20, borderCurve: "continuous", borderWidth: 2, borderStyle: "dashed", borderColor: ok() ? colors.accent : colors.faint, backgroundColor: alpha(colors.background, 0.88) }}>
+        <View style={{ width: 56, height: 56, borderRadius: 16, alignItems: "center", justifyContent: "center", backgroundColor: ok() ? tints.accent : colors.raised }}>
+          <Icon name="image" size={28} tint={ok() ? colors.accent : colors.muted} />
+        </View>
+        <Text style={{ fontSize: 17, fontWeight: "600", color: colors.text }}>{L("Drop to attach", "松开以添加附件")}</Text>
+        <Text testID="drop-detail" style={{ fontSize: 14, color: colors.muted, numberOfLines: 1, maxWidth: 360 }}>{detail()}</Text>
+      </View>
     </View>
   );
 }
@@ -5219,6 +5583,7 @@ function Connected(props: { config: Config; openRef: string | null; onExpired: (
         for (const id of [...showing]) closeNotification(id);
         setBadge(0);
         await hub.logout();
+        clearDocCache();
         props.onLogout();
       }}
     />

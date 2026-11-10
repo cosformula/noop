@@ -285,7 +285,7 @@ export const TOOLS: Tool[] = [
   { name: "remember", title: "Remember", annotations: RW, write: true,
     inputSchema: obj({ text: str("The rule or fact, one or two sentences, phrased so it is useful later (who/what it applies to, and why)"),
       file: str("memory/owner.md (who the owner is), memory/principles.md (how to work), memory/taste.md (UI/code taste), memory/projects.md, or agents/<name>/memory.md for one agent's know-how") }, ["text", "file"]),
-    description: "Write a durable memory the whole fleet reads from now on: the owner's preference, a rule ('以后都这样'), a fact about a project." },
+    description: "Write a durable memory the whole fleet reads from now on: the owner's preference, a rule ('always do this'), a fact about a project." },
   { name: "edit_memory", title: "Edit or delete a memory", annotations: DESTRUCTIVE, write: true,
     inputSchema: obj({ file: str("The memory file, as listed by read_memory"),
       match: str("Text copied from the entry, enough to pick exactly one line (find it with read_memory first)"),
@@ -495,7 +495,8 @@ export function channelsView(st: ToolStore, nowMs = Date.now(), limit = 100) {
 
 /** A channel's digest: the main-chat messages about its tasks and cards (results, decisions, the owner's words), newest
  *  last. Task-thread chatter and the hub's own acks are execution detail, so they stay on the task page. */
-export function channelDigest<E extends { ref?: string; from: string; thread?: boolean; kind?: string }>(events: readonly E[], refs: readonly string[], limit = 80): E[] {
+export function channelDigest<E extends { ref?: string; from: string; thread?: boolean; kind?: string; channel?: string }>(events: readonly E[], refs: readonly string[], slug?: string, limit = 80): E[] {
   const want = new Set(refs);
-  return events.filter((e) => !!e.ref && want.has(e.ref) && !e.thread && !/^hub/.test(e.from) && e.kind !== "system").slice(-limit);
+  // what was said in the channel itself (the owner, the team's replies) plus the main chat's results and cards about its work
+  return events.filter((e) => !e.thread && (e.channel ? e.channel === slug : !!e.ref && want.has(e.ref) && !/^hub/.test(e.from) && e.kind !== "system")).slice(-limit);
 }

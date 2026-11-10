@@ -48,7 +48,7 @@ function hub(posts: { text: string; reply_to?: string }[], extra: unknown[] = []
     [`POST ${URL}/api/messages`]: (r: { body?: string | null }) => {
       const m = JSON.parse(r.body!);
       posts.push(m);
-      return { body: { id: `o${posts.length}`, ts: new Date().toISOString(), from: "owner", kind: "owner", text: m.text, ref: m.reply_to, client_id: m.client_id } };
+      return { body: { id: `o${posts.length}`, ts: new Date().toISOString(), from: "owner", kind: "owner", text: m.text, ref: m.reply_to, client_id: m.client_id, ...(m.channel ? { channel: m.channel } : {}) } };
     },
   };
 }
@@ -222,6 +222,24 @@ describe("channel", () => {
     await app.waitFor("Long timeline message 89");
     expect(app.shows("Long timeline message 0")).toBe(false);
   });
+  test("decision jumps load older history and return to the bottom promptly", async () => {
+    const many = Array.from({ length: 500 }, (_, i) => ({
+      id: `jump-${i}`, ts: ts(10 + i / 100), from: "agent", kind: "notice",
+      text: `Jump message ${i}\n${"Long message content. ".repeat(i % 9 + 1)}`,
+    }));
+    const app = await open("./App.tsx", { storage: STORAGE, width: 1200, height: 800, platform: "macos", network: hub([], many) });
+    await app.waitFor("text:/Jump message 499/");
+    await app.wait(350);
+    const start = Date.now();
+    await app.press("label:D-0001");
+    await app.waitFor("id:opt-D-0001-B", { timeout: 2000 });
+    expect(Date.now() - start).toBeLessThan(2000);
+    await app.waitFor("label:Back to bottom");
+    await app.wait(700);
+    await app.press("label:Back to bottom");
+    await app.waitFor("text:/Jump message 499/", { timeout: 2000 });
+    await app.waitUntil(() => !app.shows("label:Back to bottom"), { timeout: 2000 });
+  });
   test("the channel shows the newest 200 messages; older ones load on request", async () => {
     const many = Array.from({ length: 250 }, (_, i) => ({ id: `page-${i}`, ts: ts(i / 5), from: "agent", kind: "notice", text: `Paged message ${i}` }));
     const app = await open("./App.tsx", { storage: STORAGE, width: 390, height: 800, platform: "ios", network: hub([], many) });
@@ -243,14 +261,14 @@ describe("channel", () => {
       network: { ...hub([], many), [`GET ${URL}/api/feed?*`]: () => ({ body: { events: later.splice(0) } }) },
     });
     await app.waitUntil(() => app.texts().some((text) => text.startsWith("Tail message")));
-    if (app.shows("label:Jump to latest")) await app.press("label:Jump to latest");
+    if (app.shows("label:Back to bottom")) await app.press("label:Back to bottom");
     await app.waitFor("Tail message 249");
     await app.wait(300); // Let initial list measurements and the initial scroll settle.
-    expect(app.shows("label:Jump to latest")).toBe(false);
+    expect(app.shows("label:Back to bottom")).toBe(false);
 
     // Just off the end, closer than a message: it stays put and counts what came below.
     await app.scroll("id:timeline", platform === "ios" ? -40 : -240);
-    await app.waitFor("Jump to latest");
+    await app.waitFor("Back to bottom");
     arrive("Below the fold");
     await app.waitFor("1 new messages", { timeout: 10000 });
     await app.wait(300); // following would reach the end, and the end clears the count
@@ -268,12 +286,12 @@ describe("channel", () => {
     expect(onScreen().filter((t) => !before.includes(t))).toEqual([]);
 
     // Back at the end, new messages show by themselves.
-    await app.press("label:Jump to latest");
+    await app.press("label:Back to bottom");
     await app.waitFor("Further below");
-    await app.waitUntil(() => !app.shows("label:Jump to latest"));
+    await app.waitUntil(() => !app.shows("label:Back to bottom"));
     arrive("Followed");
     await app.waitFor("Followed", { timeout: 10000 });
-    expect(app.shows("label:Jump to latest")).toBe(false);
+    expect(app.shows("label:Back to bottom")).toBe(false);
   });
 
   test("a new message preserves existing content", async () => {
@@ -357,9 +375,16 @@ describe("channel", () => {
       { id: "e11", ts: ts(11), from: "dev@linux-box", kind: "notice", ref: "T-0005", text: "手机上也正常，截图附上" },
       { id: "e12", ts: ts(12), from: "hub", kind: "system", ref: "T-0005", text: "收到，已补充到 T-0005" },
     ];
-    const app = await open("./App.tsx", { storage: STORAGE, network: hub(posts, said), width: 1200, height: 800, platform: "macos" });
+    const app = await open("./App.tsx", { storage: STORAGE, network: {
+      ...hub(posts, said),
+      [`GET ${URL}/api/tasks/get?*`]: { body: { id: "T-0005", title: "修复登录页", agent: "dev", state: "done", created: ts(1), request: "请修复登录页在手机上的布局", runs: [
+        { ts: ts(5), host: "linux-box", cli: "codex", status: "done", summary: "已修复登录页布局，桌面验证通过" },
+      ] } },
+    }, width: 1200, height: 800, platform: "macos" });
     await app.press("id:task-chip-T-0005 >> nth=0");
     await app.waitFor("id:task-talk");
+    await app.waitFor("text:已修复登录页布局，桌面验证通过");
+    expect(app.shows("text:请修复登录页在手机上的布局")).toBe(true);
     expect(app.shows("text:登录页在手机上也看一下")).toBe(true);
     expect(app.shows("text:手机上也正常，截图附上")).toBe(true);
     await app.type("id:task-composer", "再看下 iPad");
@@ -427,6 +452,30 @@ describe("channel", () => {
     expect(app.openedUrls()).toEqual(["https://github.com/acme/nsh/issues/770", "https://github.com/acme/nsh/issues/746"]);
   });
 
+  test("a #N after a repository the channel never linked stays text, not the one named before it", async () => {
+    const thread = [
+      { id: "e10", ts: ts(10), from: "lead@linux-box", kind: "notice", text: "见 https://github.com/acme/core-api/pull/41" },
+      { id: "e11", ts: ts(11), from: "lead@linux-box", kind: "notice", text: "core-api #41 只等评审。video-tool #2、#3 和 docs #12 都能合并。\ncore-api：#42 待审；\ndocs：#13 无检查记录。" },
+    ];
+    const app = await open("./App.tsx", { storage: STORAGE, network: hub([], thread), width: 1200, height: 800, platform: "macos" });
+    await app.waitFor("text:#42");
+    for (const n of ["#2", "#3", "#12", "#13"]) expect(app.shows(`text:${n}`)).toBe(false);
+    await app.press("text:core-api #41");
+    await app.press("text:#42");
+    expect(app.openedUrls()).toEqual(["https://github.com/acme/core-api/issues/41", "https://github.com/acme/core-api/issues/42"]);
+  });
+
+  test("a paragraph links each PR once: the bare URL after its ref is dropped", async () => {
+    const thread = [
+      { id: "e10", ts: ts(10), from: "reviewer@linux-box", kind: "notice", text: "已评审 NSH #1394 https://github.com/acme/nsh/pull/1394 ，没发现问题。" },
+    ];
+    const app = await open("./App.tsx", { storage: STORAGE, network: hub([], thread), width: 1200, height: 800, platform: "macos" });
+    await app.waitFor("text:NSH #1394");
+    expect(app.shows("text:nsh#1394")).toBe(false);
+    await app.press("text:NSH #1394");
+    expect(app.openedUrls()).toEqual(["https://github.com/acme/nsh/issues/1394"]);
+  });
+
   test("an answer quotes the card it replies to; pressing the quote goes back to the card", async () => {
     const reply = { id: "e9", ts: ts(9), from: "owner", kind: "owner", ref: "D-0001", text: "B，但先跑一遍测试" };
     const app = await open("./App.tsx", { storage: STORAGE, network: hub([], [reply]), width: 1200, height: 800, platform: "macos" });
@@ -445,6 +494,20 @@ describe("channel", () => {
     // the sidebar drops it at once, before the hub's status catches up
     expect(app.shows("text:要不要升级依赖？")).toBe(true);
     await app.waitUntil(() => !app.shows("text:要不要升级依赖？"));
+  });
+
+  test("a next-steps menu takes several items at once", async () => {
+    const posts: { text: string; reply_to?: string }[] = [];
+    const menu = { id: "menu-1", ts: ts(9), from: "Tudi@lb", kind: "menu", ref: "D-0900", text: "*D-0900* · Tudi：团队空闲了，下一步做哪些？\n1. [rust-maintainer] 修复快捷键串窗\n2. [rust-maintainer] 修复窗口属性丢失\n3. [rust-maintainer] 修复依赖冲突\n建议：*1*",
+      options: ["1. [rust-maintainer] 修复快捷键串窗", "2. [rust-maintainer] 修复窗口属性丢失", "3. [rust-maintainer] 修复依赖冲突"] };
+    const app = await open("./App.tsx", { storage: STORAGE, network: hub(posts, [menu]), width: 1200, height: 800, platform: "macos" });
+    await app.waitFor("id:proposal-D-0900-1");
+    await app.press("id:proposal-D-0900-1");
+    await app.press("id:proposal-D-0900-3");
+    await app.waitFor("Approve selected (2)");
+    await app.press("id:approve-D-0900");
+    await app.waitUntil(() => posts.length === 1);
+    expect(posts[0]).toMatchObject({ text: "D-0900 1,3" });
   });
 
   test("replies to an agent's message: the reply names its task and quotes it", async () => {
@@ -478,7 +541,7 @@ describe("channel", () => {
     await app.rightClick("text:要不要升级依赖？ >> nth=0");
     await app.press("id:side-ignore-D-0001");
     await app.waitUntil(() => posts.length === 2);
-    expect(posts[1]).toEqual({ text: "D-0001 忽略" });
+    expect(posts[1]).toMatchObject({ text: "D-0001 忽略" });
     await app.waitUntil(() => !app.shows("id:ignore-D-0001"));
   });
 
@@ -546,6 +609,19 @@ describe("channel", () => {
     await app.waitFor("Task T-0005");
   });
 
+  test("a machine page on a phone keeps a long latest step inside the screen", async () => {
+    const step = "Bash · Capture phone screenshots and compare every page with the desktop layout";
+    const host = { ...status.hosts[0], running: [{ ...status.hosts[0].running[0], activity: { at: new Date().toISOString(), step, model: "claude-opus-5-5" } }] };
+    const app = await open("./App.tsx", {
+      storage: STORAGE, width: 390, height: 844, platform: "ios",
+      network: { ...hub([]), [`GET ${URL}/api/status`]: { body: { ...status, hosts: [host] } } },
+    });
+    await app.press("label:Menu");
+    await app.press("label:Load 42% · Disk 120 GB free · 1 running");
+    await app.waitFor("Running");
+    expect(app.shows("截图检查 gallery")).toBe(true);
+  });
+
   test("all tasks: older ones load page by page, and any of them opens", async () => {
     const row = (i: number) => ({ id: `T-${1000 + i}`, title: `旧任务 ${i}`, agent: "lead", state: "done", updated: ts(1) });
     const app = await open("./App.tsx", {
@@ -578,6 +654,7 @@ describe("channel", () => {
       { slug: "omamail", name: "Omamail", goal: "omamail 的 PR 与 issue", status: "active", created: ts(-900), last_activity: fresh, stale: false, count: 2,
         items: [{ id: "T-0700", kind: "task", title: "omamail #460 审查", state: "done", updated: fresh }, { id: "D-0700", kind: "decision", title: "合并 omamail #460 吗？", state: "closed", updated: ts(30), task: "T-0700" }] },
       { slug: "omasend", name: "Omasend", goal: "omasend", status: "active", created: ts(-20000), last_activity: ts(-20000), stale: true, count: 0, items: [] },
+      { slug: "old-ops", name: "Old ops", goal: "retired", status: "archived", created: ts(-30000), last_activity: ts(-30000), stale: true, count: 0, items: [] },
     ];
     const app = await open("./App.tsx", {
       storage: { ...STORAGE, "noop.channels.since": ts(-10000) }, width: 1200, height: 800, platform: "macos",
@@ -589,18 +666,48 @@ describe("channel", () => {
     });
     await app.waitFor("id:side-channel-omamail");
     await app.waitFor("Quiet 7d");
+    // archived channels are folded under one row until it is opened
+    expect(app.shows("id:side-channel-old-ops")).toBe(false);
+    await app.press("id:side-channels-archived");
+    await app.waitFor("id:side-channel-old-ops");
+    await app.press("id:side-channels-archived");
     await app.press("id:side-channel-omamail");
     await app.waitFor("omamail 的 PR 与 issue");
-    await app.waitFor("omamail #460 审查");
-    await app.waitFor("合并 omamail #460 吗？");
     await app.press("id:channel-edit-goal");
     await app.waitFor("id:channel-goal-input");
+    await app.type("id:channel-name-input", " 邮件");
     await app.type("id:channel-goal-input", "，以及发布");
     await app.press("id:channel-save-goal");
     await app.waitFor("omamail 的 PR 与 issue，以及发布");
+    await app.waitFor("Omamail 邮件");
     await app.press("id:channel-archive");
     await app.waitFor("id:channel-archived");
-    expect(posts).toEqual([{ slug: "omamail", goal: "omamail 的 PR 与 issue，以及发布" }, { slug: "omamail", archived: true }]);
+    expect(posts).toEqual([{ slug: "omamail", name: "Omamail 邮件", goal: "omamail 的 PR 与 issue，以及发布" }, { slug: "omamail", archived: true }]);
+  });
+
+  test("a channel is its own room: messages sent there carry the channel, and its talk stays out of the main chat", async () => {
+    const posts: any[] = [];
+    const chans = [{ slug: "nsh-i18n", name: "NSH i18n", goal: "NSH 多语言", status: "active", created: ts(-900), last_activity: ts(5), stale: false, count: 0, refs: [], items: [] }];
+    const talk = [
+      { id: "c1", ts: ts(3), from: "owner", kind: "owner", text: "日文翻译进度如何？", channel: "nsh-i18n" },
+      { id: "c2", ts: ts(4), from: "lead@primary", kind: "notice", text: "日文已完成 80%，剩下 API 文档", channel: "nsh-i18n" },
+    ];
+    const app = await open("./App.tsx", {
+      storage: STORAGE, width: 1200, height: 800, platform: "macos",
+      network: { ...hub(posts, talk), [`GET ${URL}/api/channels`]: { body: { channels: chans } }, [`GET ${URL}/api/channels/feed?*`]: { body: { events: talk } } },
+    });
+    await app.waitFor("id:composer");
+    expect(app.shows("日文已完成 80%，剩下 API 文档")).toBe(false);
+    await app.waitFor("id:side-channel-nsh-i18n");
+    await app.press("id:side-channel-nsh-i18n");
+    await app.waitFor("日文已完成 80%，剩下 API 文档");
+    await app.type("id:composer", "韩文也一起补上");
+    await app.press("id:send");
+    await app.waitUntil(() => posts.length === 1, { timeout: 10_000 });
+    expect(posts[0]).toMatchObject({ text: "韩文也一起补上", channel: "nsh-i18n" });
+    await app.waitFor("韩文也一起补上");
+    await app.press("text:Channel");
+    await app.waitUntil(() => !app.shows("韩文也一起补上"));
   });
 
   test("a dropped connection stays quiet until reconnecting keeps failing", async () => {
@@ -616,6 +723,9 @@ describe("channel", () => {
       storage: STORAGE, width: 1200, height: 800, platform: "macos",
       network: { ...hub([]), [`GET ${URL}/api/status`]: { body: { ...status, recent: [nohost, ...status.recent] } } },
     });
+    await app.waitFor("id:side-queued");
+    expect(app.shows("Waiting for Windows machine")).toBe(false); // 排队 starts collapsed
+    await app.press("id:side-queued");
     await app.waitFor("Waiting for Windows machine");
     await app.press("label:T-0097 · Waiting for a machine");
     await app.waitFor("id:task-nohost");
@@ -629,6 +739,7 @@ describe("channel", () => {
       storage: STORAGE, width: 1200, height: 800, platform: "macos",
       network: { ...hub([]), [`GET ${URL}/api/status`]: { body: { ...status, recent: [parked, ...status.recent] } } },
     });
+    await app.press("id:side-queued");
     await app.waitFor("Waiting");
     await app.press("label:T-0236 · Waiting on external result");
     await app.waitFor("id:cancel-task");
@@ -709,6 +820,84 @@ describe("images", () => {
     };
   }
 
+  test("the newest Markdown report opens in the reader pane, which zooms, closes and reopens", async () => {
+    const report = { id: "r1", ts: ts(8), from: "lead@mac", kind: "notice", text: "推送通知梳理完成", attachments: ["/media/1762650000000-push-notifications.md"] };
+    const app = await open("./App.tsx", {
+      ...desk,
+      network: { ...hub([], [report]), [`GET ${URL}/media/*`]: { body: "# Push notifications\n\nAPNs and **FCM** support." } },
+    });
+    await app.waitFor("id:doc-attachment");
+    expect(app.shows("text:push-notifications")).toBe(true);
+    // opened by itself, beside the chat on a wide window
+    await app.waitFor("id:doc-side");
+    await app.waitUntil(() => app.shows("text:Push notifications"));
+    expect(app.shows("text:Markdown · Reading")).toBe(true);
+    expect(app.shows("text:100%")).toBe(true);
+    await app.press("id:doc-zoom-in");
+    await app.waitUntil(() => app.shows("text:113%"));
+    await app.press("id:doc-zoom-out");
+    await app.press("id:doc-zoom-out");
+    await app.waitUntil(() => app.shows("text:88%"));
+    await app.press("id:doc-expand");
+    await app.press("id:doc-close");
+    await app.waitUntil(() => !app.shows("id:doc-reader"));
+    // closing doesn't bring it back; the header button and the card reopen it
+    await app.press("id:doc-reopen");
+    await app.waitFor("id:doc-reader");
+    await app.press("id:doc-close");
+    await app.waitUntil(() => !app.shows("id:doc-reader"));
+    await app.press("id:doc-attachment");
+    await app.waitFor("id:doc-reader");
+  });
+
+  test("a report on a task page opens in that page's reader and stays there", async () => {
+    const report = { id: "r9", ts: ts(9), from: "dev@linux-box", kind: "notice", ref: "T-0005", thread: true, text: "调研完成", attachments: ["/media/1762650000000-task-report.md"] };
+    const app = await open("./App.tsx", {
+      ...desk,
+      network: {
+        ...hub([], [{ id: "e1", ts: ts(1), from: "dev@linux-box", kind: "notice", text: "见 T-0005" }, report]),
+        [`GET ${URL}/api/tasks/get?*`]: { body: { id: "T-0005", title: "调研", agent: "dev", state: "done", created: ts(1), request: "调研", runs: [] } },
+        [`GET ${URL}/media/*`]: { body: "# Task findings" },
+      },
+    });
+    await app.press("id:task-chip-T-0005 >> nth=0");
+    await app.waitFor("id:doc-attachment");
+    expect(app.shows("id:doc-reader")).toBe(false);
+    await app.press("id:doc-attachment");
+    await app.waitFor("id:doc-side");
+    await app.waitUntil(() => app.shows("text:Task findings"));
+    // back on the channel, the task's report is not shown in the channel's reader
+    await app.press("Channel >> nth=0");
+    await app.waitUntil(() => app.shows("text:开始处理 T-0007，很快完成"));
+    expect(app.shows("id:doc-reader")).toBe(false);
+  });
+
+  test("a report that fails to load offers Retry, which loads it", async () => {
+    let calls = 0;
+    const report = { id: "r1", ts: ts(8), from: "lead@mac", kind: "notice", text: "报告", attachments: ["/media/1762650000000-flaky.md"] };
+    const app = await open("./App.tsx", {
+      ...desk,
+      network: { ...hub([], [report]), [`GET ${URL}/media/*`]: () => (++calls === 1 ? { status: 500, body: "" } : { body: "# Second try" }) },
+    });
+    await app.waitFor("id:doc-retry");
+    expect(app.shows("text:Couldn’t load (500)")).toBe(true);
+    await app.press("id:doc-retry");
+    await app.waitUntil(() => app.shows("text:Second try"));
+    expect(calls).toBe(2);
+  });
+
+  test("on a phone the report reader covers the chat as a sheet", async () => {
+    const report = { id: "r1", ts: ts(8), from: "lead@mac", kind: "notice", text: "报告", attachments: ["/media/1762650000000-report.md"] };
+    const app = await open("./App.tsx", {
+      ...desk, width: 390, height: 844,
+      network: { ...hub([], [report]), [`GET ${URL}/media/*`]: { body: "# Report" } },
+    });
+    await app.waitFor("id:doc-sheet");
+    expect(app.shows("id:doc-expand")).toBe(false);
+    await app.press("id:doc-close");
+    await app.waitUntil(() => !app.shows("id:doc-sheet"));
+  });
+
   test("a picked image shows as a thumbnail, can be removed, and is sent with the text", async () => {
     const posts: { text: string; attachments?: string[] }[] = [];
     const uploads: string[] = [];
@@ -760,10 +949,10 @@ describe("images", () => {
     expect(posts[0]).toMatchObject({ text: "", attachments: ["/media/shot-1.png"] });
   });
 
-  test("an image file dropped on the composer attaches", async () => {
+  test("an image file dropped anywhere on the window attaches", async () => {
     const app = await open("./App.tsx", { ...desk, network: withUploads([], []) });
     await app.waitFor("id:composer");
-    await app.dropFiles("id:composer-area", [`file://${here("icon.png")}`]);
+    await app.dropFiles("id:drop-window", [`file://${here("icon.png")}`]);
     await app.waitFor("id:attachment");
     expect(app.count("id:attachment")).toBe(1);
   });
@@ -1608,7 +1797,6 @@ test("channels share per-message read state with main chat, and Menu can mark al
   await app.waitFor("text:Shared channel result");
   expect(app.shows("text:Running cargo test")).toBe(false); // task-thread steps stay on the task page
   expect(app.shows("text:收到 D-1")).toBe(false);
-  await app.press("id:channel-msg-shared-old");
   await app.waitUntil(() => {
     const raw = app.storage()[`hub.read:${URL}`];
     return !!raw && JSON.parse(raw).ids.includes("shared-old");
@@ -1619,4 +1807,190 @@ test("channels share per-message read state with main chat, and Menu can mark al
   await app.press("id:mark-all-read");
   await app.waitUntil(() => { const raw = app.storage()[`hub.read:${URL}`]; return !!raw && !!JSON.parse(raw).through; });
   expect(app.shows("id:menu-unread-count")).toBe(false);
+});
+
+describe("folding page heads", () => {
+  const omamail = { slug: "omamail", name: "Omamail", goal: "Mail quality and releases", status: "active", created: ts(-900), last_activity: ts(5), stale: false, count: 0, refs: [], items: [] };
+  const quiet = { ...omamail, slug: "quiet", name: "Quiet room", goal: "Nothing much" };
+  const talk = Array.from({ length: 60 }, (_, i) => ({ id: `fold-${i}`, ts: ts(1 + i / 100), from: "agent", kind: "notice", text: `Channel line ${i}`, channel: "omamail" }));
+  const channelHub = () => ({
+    ...hub([], talk),
+    [`GET ${URL}/api/channels`]: { body: { channels: [omamail, quiet] } },
+    [`GET ${URL}/api/channels/feed?*`]: (r: { url: string }) => ({ body: { events: r.url.includes("quiet") ? [] : talk } }),
+  });
+
+  for (const platform of ["macos", "ios", "android"] as const) {
+    test(`a channel's head folds into the bar away from the top and unfolds back there (${platform})`, async () => {
+      const app = await open("./App.tsx", { storage: STORAGE, width: platform === "macos" ? 1200 : 390, height: 800, platform, network: channelHub() });
+      await app.waitFor("id:composer");
+      // the bar no longer carries a connection pill
+      expect(app.shows("text:Live")).toBe(false);
+      expect(app.shows("id:conn")).toBe(false);
+      if (platform !== "macos") await app.press("label:Menu");
+      await app.press("id:side-channel-omamail");
+      await app.waitFor("Channel line 59");
+      // opened at the newest message, the head is far above: the bar holds the name and goal
+      await app.waitFor("id:page-title-folded");
+      expect(app.shows("label:# Omamail, back to the top")).toBe(true);
+      expect(app.shows("id:page-title-detail")).toBe(true);
+      expect(app.shows("text:Mail quality and releases")).toBe(true);
+
+      // back at the top, the head is the page's own again, with its actions
+      await app.scroll("id:timeline", -20000);
+      await app.waitFor("id:channel-edit-goal");
+      await app.waitUntil(() => !app.shows("id:page-title-folded"));
+      expect(app.shows("id:channel-archive")).toBe(true);
+      if (platform === "macos") expect(app.shows("id:page-title")).toBe(true);
+
+      // away from it again it folds; the folded title brings the head back
+      await app.scroll("id:timeline", 20000);
+      await app.waitFor("Channel line 59");
+      await app.waitFor("id:page-title-folded");
+      expect(app.shows("label:Back to bottom")).toBe(false); // still following the newest
+      await app.press("id:page-title-folded");
+      await app.waitFor("id:channel-edit-goal");
+      await app.waitUntil(() => !app.shows("id:page-title-folded"));
+
+      // another channel starts unfolded; the main chat has no head to fold
+      await app.scroll("id:timeline", 20000);
+      await app.waitFor("id:page-title-folded");
+      if (platform !== "macos") await app.press("label:Menu");
+      await app.press("id:side-channel-quiet");
+      await app.waitFor("Nothing much");
+      expect(app.shows("id:page-title-folded")).toBe(false);
+      if (platform !== "macos") await app.press("label:Menu");
+      await app.press("id:side-channel-omamail");
+      await app.waitFor("Channel line 59");
+      await app.waitFor("id:page-title-folded");
+      if (platform !== "macos") await app.press("label:Menu");
+      await app.press(platform === "macos" ? "text:Channel" : "text:Channel >> nth=0");
+      await app.waitUntil(() => !app.shows("Channel line 59"));
+      expect(app.shows("id:page-title-folded")).toBe(false);
+    });
+  }
+
+  for (const platform of ["macos", "ios"] as const) {
+    test(`a task's head folds into the bar and its actions come back at the top (${platform})`, async () => {
+      const said = Array.from({ length: 40 }, (_, i) => ({ id: `task-said-${i}`, ts: ts(10 + i / 100), from: "dev@linux-box", kind: "notice", ref: "T-0007", thread: true, text: `Task progress ${i}` }));
+      const app = await open("./App.tsx", { storage: STORAGE, width: platform === "macos" ? 1200 : 390, height: 800, platform, network: {
+        ...hub([], said),
+        [`GET ${URL}/api/status`]: { body: { ...status, active: [{ ...status.active[0], state: "active", started: ts(50) }] } },
+        [`GET ${URL}/api/tasks/get?*`]: { body: { id: "T-0007", title: "截图检查 gallery", agent: "dev", host: "linux-box", state: "active", started: ts(50), request: "截图检查 gallery", runs: [] } },
+      } });
+      await app.waitFor("id:composer");
+      if (platform !== "macos") await app.press("label:Menu");
+      await app.press("text:截图检查 gallery");
+      await app.waitFor("id:task-head");
+      await app.waitFor("id:cancel-task");
+      expect(app.shows("id:page-title-folded")).toBe(false);
+      expect(app.shows("text:Live")).toBe(false);
+
+      await app.scroll("id:task-page", 1200);
+      await app.waitFor("id:page-title-folded");
+      expect(app.shows("label:截图检查 gallery, back to the top")).toBe(true);
+      expect(app.shows("text:T-0007 · In progress")).toBe(true);
+
+      await app.scroll("id:task-page", -20000);
+      await app.waitUntil(() => !app.shows("id:page-title-folded"));
+      expect(app.shows("id:cancel-task")).toBe(true);
+
+      await app.scroll("id:task-page", 1200);
+      await app.waitFor("id:page-title-folded");
+      await app.press("id:page-title-folded");
+      await app.waitUntil(() => !app.shows("id:page-title-folded"));
+      await app.waitFor("id:cancel-task");
+      await app.waitFor("id:finish-task");
+
+      // leaving the task leaves its folded title behind
+      await app.scroll("id:task-page", 1200);
+      await app.waitFor("id:page-title-folded");
+      if (platform === "macos") await app.press("label:Back to Channel");
+      else await app.back();
+      await app.waitUntil(() => !app.shows("id:task-head"));
+      expect(app.shows("id:page-title-folded")).toBe(false);
+    });
+  }
+});
+
+
+describe("decision notification", () => {
+  for (const platform of ["ios", "android", "macos", "web"] as const) {
+    test(`${platform}: a long decision can be dismissed or opened on a narrow screen`, async () => {
+      let next: unknown[] = [];
+      const app = await open("./App.tsx", {
+        storage: STORAGE, platform, width: 320, height: 740,
+        safeArea: { top: 59, bottom: 34, left: 0, right: 0 },
+        network: {
+          ...hub([]),
+          [`GET ${URL}/api/feed?*`]: () => ({ body: { events: next } }),
+        },
+      });
+      await app.waitFor("id:composer");
+      expect(app.shows("id:decision-notification")).toBe(false);
+      next = [{ ...prDecision, id: "toast-1", ref: "D-0203", ts: new Date().toISOString(),
+        text: "https://github.com/longbridge/gpui-kit/pull/3848 需要你点合并：按需给窗口加圆角，所有检查已通过" }];
+      await app.waitFor("id:decision-notification", { timeout: 10000 });
+      expect(app.shows("text:gpui-kit#3848 需要你点合并：按需给窗口加圆角，所有检查已通过")).toBe(true);
+      await app.press("id:dismiss-decision-notification");
+      expect(app.shows("id:decision-notification")).toBe(false);
+      next = [{ ...prDecision, id: "toast-2", ref: "D-0204", ts: new Date().toISOString() }];
+      await app.waitFor("id:decision-notification", { timeout: 10000 });
+      await app.press("id:toast");
+      expect(app.shows("id:decision-notification")).toBe(false);
+      await app.waitFor("id:opt-D-0204-A");
+    });
+  }
+});
+
+describe("composer emoji", () => {
+  for (const platform of ["macos", "ios", "android"] as const) {
+    test(`composer emoji inserts without sending on ${platform}`, async () => {
+      const posts: { text: string }[] = [];
+      const app = await open("./App.tsx", { storage: STORAGE, network: hub(posts), width: platform === "macos" ? 1200 : 390, height: 800, platform });
+      await app.waitFor("id:composer");
+      await app.type("id:composer", "你好");
+      await app.press("id:emoji");
+      await app.waitFor("id:emoji-picker");
+      await app.press("label:grinning face");
+      await app.waitUntil(() => app.value("id:composer") === "你好😀");
+      expect(posts).toEqual([]);
+      await app.press("id:emoji");
+      await app.waitFor("Recent");
+      if (platform === "macos") await app.keyboard.press("escape");
+      else await app.press("id:emoji-close");
+      await app.waitUntil(() => !app.shows("id:emoji-picker"));
+      expect(app.value("id:composer")).toBe("你好😀");
+      await app.press("id:send");
+      await app.waitUntil(() => posts.length === 1);
+      expect(posts[0].text).toBe("你好😀");
+    });
+  }
+  test("composer emoji searches and restores focus after Unicode text", async () => {
+    const app = await open("./App.tsx", { storage: STORAGE, network: hub([]), width: 1200, height: 800, platform: "macos" });
+    await app.type("id:composer", "a😀b");
+    await app.press("id:emoji");
+    await app.waitFor("id:emoji-picker");
+    await app.type("label:Search emoji", "grinning face");
+    await app.waitUntil(() => app.value("label:Search emoji") === "grinning face");
+    await app.press("label:grinning face");
+    await app.waitUntil(() => app.value("id:composer") === "a😀b😀");
+    await app.keyboard.press("x");
+    await app.waitUntil(() => app.value("id:composer") === "a😀b😀x");
+  });
+});
+
+test("composer emoji also inserts into task replies", async () => {
+  const posts: { text: string; reply_to?: string }[] = [];
+  const app = await open("./App.tsx", { storage: STORAGE, network: hub(posts), width: 1200, height: 800, platform: "macos" });
+  await app.waitFor("text:T-0005");
+  await app.press("text:T-0005");
+  await app.waitFor("id:task-composer");
+  await app.type("id:task-composer", "收到");
+  await app.press("id:emoji");
+  await app.press("label:grinning face");
+  await app.waitUntil(() => app.value("id:task-composer") === "收到😀");
+  expect(posts).toEqual([]);
+  await app.press("id:task-send");
+  await app.waitUntil(() => posts.length === 1);
+  expect(posts[0]).toMatchObject({ text: "收到😀", reply_to: "T-0005" });
 });

@@ -14,6 +14,8 @@ export type HubEvent = {
   priority?: string;
   /** Said inside a task's own conversation: on the task page, not in the main channel. */
   thread?: boolean;
+  /** Said in a channel (its slug): shown there only, never in the main chat. */
+  channel?: string;
   options?: string[];
   attachments?: string[];
 };
@@ -27,7 +29,7 @@ export type HostInfo = {
   os?: string;
   arch?: string;
   clis?: string[];
-  accounts?: { cli: string; name: string; state: "ok" | "cooldown" | "login"; until?: string }[];
+  accounts?: { cli: string; name: string; state: "ok" | "cooldown" | "login"; until?: string; model?: string }[];
   running?: { id: string; title: string; agent: string; started?: string; activity?: Activity }[];
   recent?: { id: string; title: string; state?: string; finished?: string }[];
   /** The code the machine runs: its git commit, and that commit on GitHub. */
@@ -38,7 +40,7 @@ export type HostInfo = {
 };
 
 /** A running agent's latest sign of life, and (Claude) the step it took. */
-export type Activity = { at: string; step?: string; steps?: number };
+export type Activity = { at: string; step?: string; steps?: number; model?: string };
 
 /** "最近：Bash · gh pr checks 814 · 2 分钟前"; quiet for 10+ minutes reads as such (the fleet stops it at 20 and runs it again). */
 export function activityLine(a: Activity | undefined, now = Date.now()): { text: string; quiet: boolean } | null {
@@ -60,6 +62,22 @@ export type TaskInfo = {
   runs?: { ts: string; host: string; cli: string; status: string; summary: string }[];
   steps?: { day?: string; time?: string; host?: string; kind?: string; text: string }[];
 };
+
+/** A task is one chronological conversation, including results missing from the live feed. */
+export function taskConversation(task: TaskInfo, events: HubEvent[]): HubEvent[] {
+  const all = [...events];
+  const same = (text: string) => all.some((e) => e.text.trim() === text.trim());
+  if (task.request && !same(task.request)) all.push({
+    id: `request:${task.id}`, ts: task.created ?? task.started ?? events[0]?.ts ?? "1970-01-01T00:00:00Z",
+    from: "owner", kind: "owner", ref: task.id, text: task.request,
+  });
+  for (const [i, run] of (task.runs ?? []).entries()) {
+    if (!run.summary || same(run.summary)) continue;
+    all.push({ id: `run:${task.id}:${i}:${run.ts}`, ts: run.ts, from: `${task.agent}@${run.host}`,
+      kind: "notice", ref: task.id, text: run.summary });
+  }
+  return all.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+}
 
 export type Status = {
   channels_revision?: string;
@@ -92,9 +110,9 @@ export function choicesOf(e: HubEvent): string[] {
   return [...new Set(o.map((x) => (x.match(/^\s*([A-Z])\s*[:：.]/) ?? [])[1]).filter((x): x is string => !!x))];
 }
 
-/** The option the team recommends ("建议：B" in the text), if any. */
+/** The option the team recommends ("Recommended: B" or "建议：B" in the text), if any. */
 export function recommended(e: HubEvent): string | null {
-  const m = (e.text ?? "").match(/建议：\*?([^*\s　]+)/);
+  const m = (e.text ?? "").match(/(?:建议：|Recommended: )\*?([^*\s　]+)/);
   return m ? m[1].split(/[,，]/)[0] : null;
 }
 
