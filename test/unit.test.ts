@@ -137,6 +137,13 @@ test("root host: Claude is refused under root, so Claude work goes to Codex on t
   expect(failoverAccount(solo, null, ["claude"], (c) => c !== "claude")?.cli).toBe("codex");
 });
 
+test("classify: OpenAI 'no credits remaining' is a quota wall, so codex work falls back", async () => {
+  const { classify } = await import("../src/accounts");
+  expect(classify("ERROR: stream disconnected before completion: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.")).toBe("quota");
+  expect(classify("Credit balance is too low")).toBe("quota");
+  expect(classify("exit 1: task failed")).toBeNull();
+});
+
 test("restart throttle: at most one voluntary restart per hour unless forced", async () => {
   const { mkdtempSync, writeFileSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
