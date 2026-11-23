@@ -8,8 +8,10 @@ import { judgeAccuracy, routinesAwaitingApproval } from "./autonomy";
 // checkout pinned 20+ commits back by local edits, so every fix merged upstream was inert there and every figure below
 // was computed by the old formula. `behind_origin` compares against the last fetched `origin/main` (no network here).
 export function codeState(root = CODE) {
+  // 3 s killed plain `git rev-parse` on a loaded host (load 30+) and the empty output was reported as "no checkout"/unknown
+  // drift — it also failed the provenance test well inside its 120 s guard. Leave git room; a missing repo still fails fast.
   const git = (...a: string[]) => {
-    try { return Bun.spawnSync(["git", "-C", root, ...a], { stdout: "pipe", stderr: "ignore", timeout: 3000 }).stdout.toString().trim(); }
+    try { return Bun.spawnSync(["git", "-C", root, ...a], { stdout: "pipe", stderr: "ignore", timeout: 20_000 }).stdout.toString().trim(); }
     catch { return ""; }
   };
   const commit = git("rev-parse", "--short", "HEAD");
