@@ -3,6 +3,12 @@ import { expect, test } from "bun:test";
 import { startCloudBridge } from "../src/cloud";
 import { appendEvent } from "../src/server";
 
+// Wait for a condition instead of a fixed sleep: self-update runs this suite on a loaded host where the event loop
+// stalls for seconds, and a fixed 300 ms window then closed before the second upload arrived (2.1 s run, ["one"]).
+const until = async (ok: () => boolean, ms = 15_000) => {
+  for (const end = Date.now() + ms; !ok() && Date.now() < end; ) await Bun.sleep(10);
+};
+
 test("one local event is uploaded exactly once while another flush is in flight", async () => {
   const seen: any[] = [];
   let release!: () => void;
@@ -27,7 +33,8 @@ test("one local event is uploaded exactly once while another flush is in flight"
   appendEvent({ from: "test", kind: "notice", text: "two" }); // mirror hook fires a second flush
   await Bun.sleep(50);
   release();
-  await Bun.sleep(300);
+  await until(() => seen.some((e) => e.text === "two"));
+  await Bun.sleep(100); // room for a duplicate "one" to show up after "two"
   server.stop(true);
   const ids = seen.map((e) => e.text);
   console.log("uploads:", JSON.stringify(ids));
@@ -49,7 +56,8 @@ test("a refused upload waits for the poll instead of retrying in a tight loop", 
   const cfg: any = { cloud: { url: `http://127.0.0.1:${server.port}`, poll_seconds: 600 }, server: { token: "t" } };
   startCloudBridge(cfg);
   appendEvent({ from: "test", kind: "notice", text: "refused" });
-  await Bun.sleep(600);
+  await until(() => posts > 0);
+  await Bun.sleep(500); // a tight retry loop would post many more times in this window
   server.stop(true);
   expect(posts).toBe(1); // one attempt; the 3s loop owns the retry
 });
